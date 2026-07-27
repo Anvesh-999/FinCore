@@ -12,6 +12,8 @@ import initializeDatabase from './database/init.js';
 import authRoutes from './modules/auth/routes.js';
 import walletRoutes from './modules/wallets/routes.js';
 import transferRoutes from './modules/transfers/routes.js';
+import adminRoutes from './modules/admin/routes.js';
+
 
 const app = express();
 
@@ -66,6 +68,8 @@ app.use((req, res, next) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/wallet', walletRoutes);
 app.use('/api/transfers', transferRoutes);
+app.use('/api/admin', adminRoutes);
+
 
 // Health check endpoint verifying postgres, mongodb, and redis statuses
 app.get('/api/health', async (req, res) => {
