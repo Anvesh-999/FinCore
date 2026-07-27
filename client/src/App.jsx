@@ -14,6 +14,13 @@ import { PlaceholderPage } from './pages/PlaceholderPage';
 import { ProtectedRoute } from './components/ProtectedRoute';
 import { authSuccess, authFailure, setLoading } from './store/authSlice';
 import api from './services/api';
+import { Wallet } from './pages/customer/Wallet';
+import { Send } from './pages/customer/Send';
+import { Transactions } from './pages/customer/Transactions';
+import { WalletsExplorer } from './pages/admin/WalletsExplorer';
+import { TransfersExplorer } from './pages/admin/TransfersExplorer';
+import { LedgerBook } from './pages/admin/LedgerBook';
+
 
 // Route Redirector for root path '/'
 const HomeRedirect = () => {
@@ -74,10 +81,11 @@ const AppRoutes = () => {
           }
         >
           <Route path="dashboard" element={<PlaceholderPage title="Customer Dashboard Overview" />} />
-          <Route path="wallet" element={<PlaceholderPage title="My Wallet & Sandbox Cards" />} />
-          <Route path="send" element={<PlaceholderPage title="Send Money Transfer" />} />
-          <Route path="transactions" element={<PlaceholderPage title="My Transaction History" />} />
+          <Route path="wallet" element={<Wallet />} />
+          <Route path="send" element={<Send />} />
+          <Route path="transactions" element={<Transactions />} />
           <Route path="profile" element={<PlaceholderPage title="My Personal Profile" />} />
+
           <Route path="" element={<Navigate to="dashboard" replace />} />
         </Route>
 
@@ -110,10 +118,11 @@ const AppRoutes = () => {
           <Route path="dashboard" element={<PlaceholderPage title="System Operations Overview" />} />
           <Route path="customers" element={<PlaceholderPage title="Sandbox Customers Explorer" />} />
           <Route path="merchants" element={<PlaceholderPage title="Sandbox Merchants Explorer" />} />
-          <Route path="wallets" element={<PlaceholderPage title="System Wallets Ledger" />} />
+          <Route path="wallets" element={<WalletsExplorer />} />
           <Route path="payments" element={<PlaceholderPage title="Payment Orders Explorer" />} />
-          <Route path="transfers" element={<PlaceholderPage title="Transfer Entries Explorer" />} />
-          <Route path="ledger" element={<PlaceholderPage title="Double-Entry Ledger Book" />} />
+          <Route path="transfers" element={<TransfersExplorer />} />
+          <Route path="ledger" element={<LedgerBook />} />
+
           <Route path="risk" element={<PlaceholderPage title="Risk Controls & Events" />} />
           <Route path="webhooks" element={<PlaceholderPage title="Webhook Deliveries Explorer" />} />
           <Route path="reconciliation" element={<PlaceholderPage title="Reconciliation Run Reports" />} />
