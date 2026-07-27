@@ -3,6 +3,9 @@ import jwt from 'jsonwebtoken';
 import config from '../../config/config.js';
 import authRepository from './repository.js';
 import { AppError } from '../../middleware/error.js';
+import pool from '../../config/db.js';
+import ledgerService from '../ledger/service.js';
+import walletRepository from '../wallets/repository.js';
 
 export class AuthService {
   async register({ firstName, lastName, email, password, role }) {
@@ -19,15 +22,59 @@ export class AuthService {
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
-    const newUser = await authRepository.createUser({
-      firstName,
-      lastName,
-      email: normalizedEmail,
-      passwordHash,
-      role
-    });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
 
-    return newUser;
+      const newUser = await authRepository.createUser({
+        firstName,
+        lastName,
+        email: normalizedEmail,
+        passwordHash,
+        role
+      }, client);
+
+      // Create double-entry ledger account
+      const ledgerAccount = await ledgerService.createLedgerAccount('CUSTOMER', newUser.id, client);
+
+      // Create wallet: Customer role gets default $1,000.00 sandbox balance, others get $0.00
+      const defaultBalance = role === 'CUSTOMER' ? 100000n : 0n;
+      await walletRepository.createWallet({
+        userId: newUser.id,
+        availableBalance: defaultBalance,
+      }, client);
+
+      // Post onboarding grant in double-entry ledger if default balance is positive
+      if (defaultBalance > 0n) {
+        const systemAccount = await ledgerService.getOrCreateSystemAccount(client);
+        await ledgerService.postTransaction({
+          referenceType: 'ONBOARDING_GRANT',
+          referenceId: newUser.id.toString(),
+          entries: [
+            {
+              accountId: systemAccount.id,
+              direction: 'DEBIT',
+              amount: defaultBalance,
+              currency: 'USD',
+            },
+            {
+              accountId: ledgerAccount.id,
+              direction: 'CREDIT',
+              amount: defaultBalance,
+              currency: 'USD',
+            }
+          ]
+        }, client);
+      }
+
+      await client.query('COMMIT');
+      return newUser;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
   }
 
   async login({ email, password }) {
