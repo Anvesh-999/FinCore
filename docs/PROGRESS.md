@@ -3,7 +3,7 @@
 ## Project Implementation Status
 
 - **STEP 1 — FOUNDATION + DESIGN SYSTEM + AUTH** [COMPLETE]
-- **STEP 2 — WALLET + LEDGER + TRANSFER ENGINE** [NOT STARTED]
+- **STEP 2 — WALLET + LEDGER + TRANSFER ENGINE** [COMPLETE]
 - **STEP 3 — MERCHANT PAYMENTS + REFUNDS + DEVELOPER PLATFORM** [NOT STARTED]
 - **STEP 4 — WEBHOOKS + RISK + RECONCILIATION + OPERATIONS** [NOT STARTED]
 - **STEP 5 — PRODUCTION QUALITY + PERFORMANCE + DEPLOYMENT** [NOT STARTED]
@@ -21,3 +21,14 @@
   - *Commit*: `09b2898b18a221f1fb6b2803b905de7cb6c52a0a` — `chore(backend): initialize FinCore API and database configs`
 - [x] **Step 1F/1G — Role-Based Authentication & Tests**: Implement register, login, refresh, logout backend endpoints, create RBAC middlewares, design frontend Login/Register forms, write 9 Jest ESM tests with mocked PG, Redis, and Mongo instances. All 9 tests passed.
   - *Commit*: `ad8602eb61ce7b4db1fa8c49e290fa8b6c433140` — `feat(auth): implement role-based authentication and integration tests`
+
+### STEP 2 — WALLET + LEDGER + TRANSFER ENGINE [COMPLETE]
+- [x] **Step 2A — Wallet Management**: Implement sandbox wallet initialization, available and pending balance tracking, status handling, and user transaction lookup.
+- [x] **Step 2B — Double-Entry Ledger**: Implement ledger account, transaction, and entry tables; enforce the invariant that debits equal credits before posting.
+- [x] **Step 2C/2D/2E — Atomic, Idempotent, & Concurrent Transfers**: Secure customer-to-customer transfers via locking mechanism to prevent double-spending; enforce transfer idempotency via Redis key-value caching.
+- [x] **Step 2F/2G — Customer UI & Admin Ledger Explorer**: Build responsive wallet balances, peer transfer forms, transaction history, and operational admin tables.
+  - *Commits*:
+    - `fc60bdd` — `feat(ledger): implement wallet models, double-entry ledger service, and peer transfers with integration tests`
+    - `2b1103d` — `feat(admin): implement operations admin endpoints for wallets, transfers, and double-entry ledger`
+    - `4ef4bda` — `feat(frontend): implement wallet, peer transfers, transaction list, and admin wallet/transfer/ledger explorers`
+
