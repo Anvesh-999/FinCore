@@ -16,7 +16,8 @@ import {
   Activity,
   LogOut,
   Menu,
-  X
+  X,
+  RotateCcw
 } from 'lucide-react';
 import { logoutSuccess } from '../store/authSlice';
 import api from '../services/api';
@@ -45,6 +46,7 @@ export const AdminLayout = () => {
     { name: 'Merchants', path: '/admin/merchants', icon: <Store size={16} /> },
     { name: 'Wallets', path: '/admin/wallets', icon: <Wallet size={16} /> },
     { name: 'Payments', path: '/admin/payments', icon: <CreditCard size={16} /> },
+    { name: 'Refunds', path: '/admin/refunds', icon: <RotateCcw size={16} /> },
     { name: 'Transfers', path: '/admin/transfers', icon: <ArrowLeftRight size={16} /> },
     { name: 'Ledger Explorer', path: '/admin/ledger', icon: <BookOpen size={16} /> },
     { name: 'Risk Controls', path: '/admin/risk', icon: <ShieldAlert size={16} /> },

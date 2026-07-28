@@ -2,17 +2,27 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
+import { createServer } from 'http';
+import { initializeSocket } from './config/socket.js';
 import config from './config/config.js';
 import logger from './middleware/logger.js';
 import { errorHandler } from './middleware/error.js';
 import { testPostgresConnection } from './config/db.js';
 import { connectMongoDB, testMongoConnection } from './config/mongodb.js';
 import { connectRedis, testRedisConnection } from './config/redis.js';
+import rabbitMQManager from './config/rabbitmq.js';
+import webhookService from './modules/webhooks/service.js';
 import initializeDatabase from './database/init.js';
 import authRoutes from './modules/auth/routes.js';
 import walletRoutes from './modules/wallets/routes.js';
 import transferRoutes from './modules/transfers/routes.js';
 import adminRoutes from './modules/admin/routes.js';
+import merchantRoutes from './modules/merchants/routes.js';
+import paymentRoutes from './modules/payments/routes.js';
+import refundRoutes from './modules/refunds/routes.js';
+import webhookRoutes from './modules/webhooks/routes.js';
+
+
 
 
 const app = express();
@@ -69,6 +79,12 @@ app.use('/api/auth', authRoutes);
 app.use('/api/wallet', walletRoutes);
 app.use('/api/transfers', transferRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/merchant', merchantRoutes);
+app.use('/api/payments', paymentRoutes);
+app.use('/api/refunds', refundRoutes);
+app.use('/api/merchant/webhooks', webhookRoutes);
+
+
 
 
 // Health check endpoint verifying postgres, mongodb, and redis statuses
@@ -104,6 +120,10 @@ const startServer = async () => {
   const mongoConnected = await connectMongoDB();
   const redisConnected = await connectRedis();
 
+  // Connect Queue Broker and initialize worker consumers
+  await rabbitMQManager.connect();
+  await webhookService.initializeWebhookWorker();
+
   if (!pgConnected || !mongoConnected || !redisConnected) {
     logger.warn('Warning: Some databases failed to connect. Ensure PostgreSQL, MongoDB, and Redis are running locally.');
   }
@@ -117,11 +137,17 @@ const startServer = async () => {
     }
   }
 
-  const server = app.listen(config.port, () => {
-    logger.info(`FinCore API server running in [${config.env}] mode on port ${config.port}`);
+  const httpServer = createServer(app);
+  initializeSocket(httpServer);
+
+  await new Promise((resolve) => {
+    httpServer.listen(config.port, () => {
+      logger.info(`FinCore API server running in [${config.env}] mode on port ${config.port}`);
+      resolve();
+    });
   });
   
-  return server;
+  return httpServer;
 };
 
 // Auto-run if executed directly

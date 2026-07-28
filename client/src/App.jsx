@@ -20,6 +20,20 @@ import { Transactions } from './pages/customer/Transactions';
 import { WalletsExplorer } from './pages/admin/WalletsExplorer';
 import { TransfersExplorer } from './pages/admin/TransfersExplorer';
 import { LedgerBook } from './pages/admin/LedgerBook';
+import { Overview as MerchantOverview } from './pages/merchant/Overview';
+import { Payments as MerchantPayments } from './pages/merchant/Payments';
+import { ApiKeys as MerchantApiKeys } from './pages/merchant/ApiKeys';
+import { Refunds as MerchantRefunds } from './pages/merchant/Refunds';
+import { Checkout } from './pages/customer/Checkout';
+import { PaymentsExplorer } from './pages/admin/PaymentsExplorer';
+import { RefundsExplorer } from './pages/admin/RefundsExplorer';
+import { Webhooks as MerchantWebhooks } from './pages/merchant/Webhooks';
+import { RiskExplorer } from './pages/admin/RiskExplorer';
+import { Reconciliation } from './pages/admin/Reconciliation';
+import { WebhooksExplorer } from './pages/admin/WebhooksExplorer';
+import { useToast } from './components/ui/Toast';
+import { connectSocket, disconnectSocket } from './services/socket';
+
 
 
 // Route Redirector for root path '/'
@@ -43,6 +57,8 @@ const HomeRedirect = () => {
 
 const AppRoutes = () => {
   const dispatch = useDispatch();
+  const { isAuthenticated, accessToken, user } = useSelector((state) => state.auth);
+  const { showToast } = useToast();
 
   // Handle auto-login persistence on startup/refresh
   useEffect(() => {
@@ -59,6 +75,43 @@ const AppRoutes = () => {
     };
     initializeAuth();
   }, [dispatch]);
+
+  // Handle Socket.IO connection and real-time operations toasts
+  useEffect(() => {
+    if (isAuthenticated && accessToken) {
+      const socket = connectSocket(accessToken);
+      
+      // Admin real-time alerts
+      if (user?.role === 'ADMIN' || user?.role === 'AUDITOR') {
+        socket.on('risk.alert', (data) => {
+          showToast('error', `[RISK ALERT] Transaction ${data.transaction_id} triggered rules: ${data.rules_triggered.join(', ')} (Score: ${data.risk_score})`);
+        });
+
+        socket.on('reconciliation.alert', (data) => {
+          showToast('error', `[LEDGER AUDIT ALERT] Reconciliation run detected ${data.inconsistencies_found} discrepancies!`);
+        });
+      }
+      
+      // General payment updates
+      socket.on('payment.updated', (data) => {
+        showToast('info', `[PAYMENT UPDATE] Order ${data.id} is now ${data.status}`);
+      });
+      
+      // General transfer updates
+      socket.on('transfer.updated', (data) => {
+        showToast('info', `[TRANSFER UPDATE] Transfer of $${(parseInt(data.amount) / 100).toFixed(2)} completed`);
+      });
+
+      return () => {
+        socket.off('risk.alert');
+        socket.off('reconciliation.alert');
+        socket.off('payment.updated');
+        socket.off('transfer.updated');
+      };
+    } else {
+      disconnectSocket();
+    }
+  }, [isAuthenticated, accessToken, user, showToast]);
 
   return (
     <BrowserRouter>
@@ -98,13 +151,23 @@ const AppRoutes = () => {
             </ProtectedRoute>
           }
         >
-          <Route path="dashboard" element={<PlaceholderPage title="Merchant Dashboard Overview" />} />
-          <Route path="payments" element={<PlaceholderPage title="Merchant Payment Orders" />} />
-          <Route path="refunds" element={<PlaceholderPage title="Merchant Refunds History" />} />
-          <Route path="api-keys" element={<PlaceholderPage title="Sandbox API Key Credentials" />} />
-          <Route path="webhooks" element={<PlaceholderPage title="Webhook Endpoints & Logs" />} />
+          <Route path="dashboard" element={<MerchantOverview />} />
+          <Route path="payments" element={<MerchantPayments />} />
+          <Route path="refunds" element={<MerchantRefunds />} />
+          <Route path="api-keys" element={<MerchantApiKeys />} />
+          <Route path="webhooks" element={<MerchantWebhooks />} />
           <Route path="" element={<Navigate to="dashboard" replace />} />
         </Route>
+
+        {/* Standalone Customer Checkout Route */}
+        <Route
+          path="/checkout/:paymentId"
+          element={
+            <ProtectedRoute allowedRoles={['CUSTOMER']}>
+              <Checkout />
+            </ProtectedRoute>
+          }
+        />
 
         {/* Operations Admin Dashboard Routes */}
         <Route
@@ -119,13 +182,14 @@ const AppRoutes = () => {
           <Route path="customers" element={<PlaceholderPage title="Sandbox Customers Explorer" />} />
           <Route path="merchants" element={<PlaceholderPage title="Sandbox Merchants Explorer" />} />
           <Route path="wallets" element={<WalletsExplorer />} />
-          <Route path="payments" element={<PlaceholderPage title="Payment Orders Explorer" />} />
+          <Route path="payments" element={<PaymentsExplorer />} />
+          <Route path="refunds" element={<RefundsExplorer />} />
           <Route path="transfers" element={<TransfersExplorer />} />
           <Route path="ledger" element={<LedgerBook />} />
 
-          <Route path="risk" element={<PlaceholderPage title="Risk Controls & Events" />} />
-          <Route path="webhooks" element={<PlaceholderPage title="Webhook Deliveries Explorer" />} />
-          <Route path="reconciliation" element={<PlaceholderPage title="Reconciliation Run Reports" />} />
+          <Route path="risk" element={<RiskExplorer />} />
+          <Route path="webhooks" element={<WebhooksExplorer />} />
+          <Route path="reconciliation" element={<Reconciliation />} />
           <Route path="audit" element={<PlaceholderPage title="Immutable Audit Trail Logs" />} />
           <Route path="health" element={<PlaceholderPage title="Databases & Services Health" />} />
           <Route path="" element={<Navigate to="dashboard" replace />} />

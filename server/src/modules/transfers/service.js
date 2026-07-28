@@ -4,6 +4,8 @@ import walletRepository from '../wallets/repository.js';
 import transferRepository from './repository.js';
 import ledgerService from '../ledger/service.js';
 import authRepository from '../auth/repository.js';
+import riskService from '../risk/service.js';
+import { emitToRoom } from '../../config/socket.js';
 import { AppError } from '../../middleware/error.js';
 import logger from '../../middleware/logger.js';
 
@@ -86,6 +88,9 @@ export class TransferService {
         description,
       }, client);
 
+      // Run risk assessment check
+      await riskService.checkTransactionRisk(senderWallet.id, 'TRANSFER', transferId, transferAmount.toString());
+
       // 7. Resolve double-entry ledger accounts
       const senderLedgerAccount = await ledgerService.findLedgerAccount('CUSTOMER', senderUser.id, client);
       const recipientLedgerAccount = await ledgerService.findLedgerAccount('CUSTOMER', recipientUser.id, client);
@@ -124,6 +129,23 @@ export class TransferService {
       await client.query('COMMIT');
       logger.info(`Transfer ${transferId} of ${transferAmount} cents completed from ${senderUser.email} to ${recipientUser.email}`);
       
+      const payload = {
+        id: completedTransfer.id,
+        senderWalletId: completedTransfer.sender_wallet_id,
+        recipientWalletId: completedTransfer.recipient_wallet_id,
+        amount: completedTransfer.amount.toString(),
+        status: completedTransfer.status,
+        description: completedTransfer.description,
+        createdAt: completedTransfer.created_at,
+        sender: { firstName: senderUser.first_name, lastName: senderUser.last_name, email: senderUser.email },
+        recipient: { firstName: recipientUser.first_name, lastName: recipientUser.last_name, email: recipientUser.email }
+      };
+
+      // Emit real-time updates
+      emitToRoom(`customer_${senderUser.id}`, 'transfer.updated', payload);
+      emitToRoom(`customer_${recipientUser.id}`, 'transfer.updated', payload);
+      emitToRoom('admin', 'transfer.updated', payload);
+
       return {
         id: completedTransfer.id,
         senderWalletId: completedTransfer.sender_wallet_id,

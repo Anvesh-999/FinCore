@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getWallets, updateWalletStatus, getTransfers, getLedgerBook } from './controller.js';
+import { getWallets, updateWalletStatus, getTransfers, getLedgerBook, getPayments, getRefunds, getRiskAssessments, getReconciliationRuns, triggerReconciliationCheck, getWebhookDeliveries } from './controller.js';
 import { protect, restrictTo } from '../../middleware/auth.js';
 
 const router = Router();
@@ -12,8 +12,14 @@ router.use(restrictTo('ADMIN', 'AUDITOR'));
 router.get('/wallets', getWallets);
 router.get('/transfers', getTransfers);
 router.get('/ledger', getLedgerBook);
+router.get('/payments', getPayments);
+router.get('/refunds', getRefunds);
+router.get('/risk/assessments', getRiskAssessments);
+router.get('/reconciliation/runs', getReconciliationRuns);
+router.get('/webhooks', getWebhookDeliveries);
 
 // Write operations restricted ONLY to Admin
 router.post('/wallets/:id/status', restrictTo('ADMIN'), updateWalletStatus);
+router.post('/reconciliation/check', restrictTo('ADMIN'), triggerReconciliationCheck);
 
 export default router;
