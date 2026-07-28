@@ -23,21 +23,18 @@ export class AuthService {
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
-    const client = await pool.connect();
     try {
-      await client.query('BEGIN');
-
       const newUser = await authRepository.createUser({
         firstName,
         lastName,
         email: normalizedEmail,
         passwordHash,
         role
-      }, client);
+      });
 
       // Create double-entry ledger account
       const holderType = role === 'MERCHANT' ? 'MERCHANT' : 'CUSTOMER';
-      const ledgerAccount = await ledgerService.createLedgerAccount(holderType, newUser.id, client);
+      const ledgerAccount = await ledgerService.createLedgerAccount(holderType, newUser.id);
 
       // Auto-create merchant profile if role is MERCHANT
       if (role === 'MERCHANT') {
@@ -45,7 +42,7 @@ export class AuthService {
           userId: newUser.id,
           businessName: `${firstName}'s Sandbox Business`,
           businessType: 'INDIVIDUAL',
-        }, client);
+        });
       }
 
       // Create wallet: Customer role gets default $1,000.00 sandbox balance, others get $0.00
@@ -53,11 +50,11 @@ export class AuthService {
       await walletRepository.createWallet({
         userId: newUser.id,
         availableBalance: defaultBalance,
-      }, client);
+      });
 
       // Post onboarding grant in double-entry ledger if default balance is positive
       if (defaultBalance > 0n) {
-        const systemAccount = await ledgerService.getOrCreateSystemAccount(client);
+        const systemAccount = await ledgerService.getOrCreateSystemAccount();
         await ledgerService.postTransaction({
           referenceType: 'ONBOARDING_GRANT',
           referenceId: newUser.id.toString(),
@@ -75,16 +72,12 @@ export class AuthService {
               currency: 'USD',
             }
           ]
-        }, client);
+        });
       }
 
-      await client.query('COMMIT');
       return newUser;
     } catch (err) {
-      await client.query('ROLLBACK');
       throw err;
-    } finally {
-      client.release();
     }
   }
 

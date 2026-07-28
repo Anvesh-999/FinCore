@@ -1,87 +1,112 @@
-import pool from '../../config/db.js';
+import { Refund, Payment, User, Wallet } from '../../database/models.js';
 
 export class RefundRepository {
-  async createRefund({ id, paymentId, amount, currency = 'USD', status = 'CREATED', description = null }, client) {
-    const db = client || pool;
-    const query = `
-      INSERT INTO refunds (id, payment_id, amount, currency, status, description)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      RETURNING *
-    `;
-    const result = await db.query(query, [
-      id,
-      paymentId,
-      BigInt(amount),
-      currency,
-      status,
-      description
-    ]);
-    return result.rows[0];
+  formatRefund(refund) {
+    if (!refund) return null;
+    return {
+      id: refund._id,
+      payment_id: refund.paymentId,
+      paymentId: refund.paymentId,
+      amount: refund.amount,
+      currency: refund.currency,
+      status: refund.status,
+      description: refund.description,
+      created_at: refund.createdAt,
+      createdAt: refund.createdAt,
+      updated_at: refund.updatedAt,
+      updatedAt: refund.updatedAt
+    };
   }
 
-  async findById(id, client) {
-    const db = client || pool;
-    const query = 'SELECT * FROM refunds WHERE id = $1';
-    const result = await db.query(query, [id]);
-    return result.rows[0] || null;
+  async createRefund({ id, paymentId, amount, currency = 'USD', status = 'CREATED', description = null }, session) {
+    const refund = await Refund.create(
+      [{
+        _id: id,
+        paymentId,
+        amount: Number(amount),
+        currency,
+        status,
+        description
+      }],
+      { session }
+    );
+    return this.formatRefund(refund[0].toObject());
   }
 
-  async getRefundsByPaymentId(paymentId, client) {
-    const db = client || pool;
-    const query = 'SELECT * FROM refunds WHERE payment_id = $1 ORDER BY created_at DESC';
-    const result = await db.query(query, [paymentId]);
-    return result.rows;
+  async findById(id) {
+    const refund = await Refund.findById(id).lean();
+    return this.formatRefund(refund);
   }
 
-  async getRefundsSumForPayment(paymentId, client) {
-    const db = client || pool;
-    const query = `
-      SELECT COALESCE(SUM(amount), 0) as total_refunded 
-      FROM refunds 
-      WHERE payment_id = $1 AND status = 'SUCCEEDED'
-    `;
-    const result = await db.query(query, [paymentId]);
-    return BigInt(result.rows[0].total_refunded);
+  async getRefundsByPaymentId(paymentId) {
+    const refunds = await Refund.find({ paymentId }).sort({ createdAt: -1 }).lean();
+    return refunds.map(r => this.formatRefund(r));
+  }
+
+  async getRefundsSumForPayment(paymentId) {
+    const refunds = await Refund.find({ paymentId, status: 'SUCCEEDED' }).lean();
+    const sum = refunds.reduce((acc, curr) => acc + curr.amount, 0);
+    return BigInt(sum);
   }
 
   async getMerchantRefunds(merchantId) {
-    const query = `
-      SELECT r.*, p.reference, p.amount as payment_amount
-      FROM refunds r
-      JOIN payments p ON r.payment_id = p.id
-      WHERE p.merchant_id = $1
-      ORDER BY r.created_at DESC
-    `;
-    const result = await pool.query(query, [merchantId]);
-    return result.rows;
+    const payments = await Payment.find({ merchantId: Number(merchantId) }).lean();
+    const paymentIds = payments.map(p => p._id);
+    const refunds = await Refund.find({ paymentId: { $in: paymentIds } }).sort({ createdAt: -1 }).lean();
+    
+    return refunds.map(r => {
+      const p = payments.find(pay => pay._id === r.paymentId);
+      return {
+        ...this.formatRefund(r),
+        reference: p ? p.reference : null,
+        payment_amount: p ? p.amount : 0
+      };
+    });
   }
 
   async getAllRefunds() {
-    const query = `
-      SELECT r.*, p.amount as payment_amount, p.currency as payment_currency, p.reference,
-             mu.first_name as merchant_first_name, mu.last_name as merchant_last_name, mu.email as merchant_email,
-             cu.first_name as customer_first_name, cu.last_name as customer_last_name, cu.email as customer_email
-      FROM refunds r
-      JOIN payments p ON r.payment_id = p.id
-      JOIN users mu ON p.merchant_id = mu.id
-      LEFT JOIN wallets cw ON p.customer_wallet_id = cw.id
-      LEFT JOIN users cu ON cw.user_id = cu.id
-      ORDER BY r.created_at DESC
-    `;
-    const result = await pool.query(query);
-    return result.rows;
+    const refunds = await Refund.find().sort({ createdAt: -1 }).lean();
+    const formatted = [];
+
+    for (const r of refunds) {
+      const item = this.formatRefund(r);
+      const p = await Payment.findById(r.paymentId).lean();
+      if (p) {
+        item.payment_amount = p.amount;
+        item.payment_currency = p.currency;
+        item.reference = p.reference;
+
+        const merchant = await User.findById(p.merchantId).lean();
+        if (merchant) {
+          item.merchant_first_name = merchant.firstName;
+          item.merchant_last_name = merchant.lastName;
+          item.merchant_email = merchant.email;
+        }
+
+        if (p.customerWalletId) {
+          const wallet = await Wallet.findById(p.customerWalletId).lean();
+          if (wallet) {
+            const customer = await User.findById(wallet.userId).lean();
+            if (customer) {
+              item.customer_first_name = customer.firstName;
+              item.customer_last_name = customer.lastName;
+              item.customer_email = customer.email;
+            }
+          }
+        }
+      }
+      formatted.push(item);
+    }
+    return formatted;
   }
 
-  async updateRefundStatus(id, status, client) {
-    const db = client || pool;
-    const query = `
-      UPDATE refunds
-      SET status = $2, updated_at = CURRENT_TIMESTAMP
-      WHERE id = $1
-      RETURNING *
-    `;
-    const result = await db.query(query, [id, status]);
-    return result.rows[0];
+  async updateRefundStatus(id, status, session) {
+    const refund = await Refund.findByIdAndUpdate(
+      id,
+      { $set: { status, updatedAt: new Date() } },
+      { new: true, session }
+    );
+    return this.formatRefund(refund ? refund.toObject() : null);
   }
 }
 

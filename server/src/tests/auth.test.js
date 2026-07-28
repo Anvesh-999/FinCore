@@ -3,80 +3,155 @@ import request from 'supertest';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 
-// Setup Mock database state for Auth
+// Setup Mock database state for Auth in MongoDB
 let localUsers = {};
+let localWallets = {};
+let localLedgerAccounts = {};
+let localLedgerTransactions = {};
+let localLedgerEntries = {};
+let localCounters = { users: 0, wallets: 0, ledger_accounts: 0 };
 
-const mockQuery = jest.fn(async (text, params) => {
-  console.log('SQL QUERY:', text);
-  if (text.includes('SELECT * FROM users WHERE email = $1')) {
-    const email = params[0];
-    const user = Object.values(localUsers).find((u) => u.email === email);
-    return { rows: user ? [user] : [] };
-  }
+const getNextSequence = jest.fn(async (name) => {
+  localCounters[name] = (localCounters[name] || 0) + 1;
+  return localCounters[name];
+});
 
-  if (text.includes('SELECT id, first_name, last_name, email, role, created_at FROM users WHERE id = $1')) {
-    const id = params[0];
+const makeQueryChain = (result) => {
+  const chain = {
+    lean: jest.fn(() => chain),
+    session: jest.fn(() => chain),
+    sort: jest.fn(() => chain),
+    then: (resolve, reject) => Promise.resolve(result).then(resolve, reject),
+    catch: (reject) => Promise.resolve(result).catch(reject)
+  };
+  return chain;
+};
+
+const dummyModel = {
+  create: jest.fn(),
+  find: jest.fn(() => makeQueryChain([])),
+  findOne: jest.fn(() => makeQueryChain(null)),
+  findById: jest.fn(() => makeQueryChain(null)),
+  findByIdAndUpdate: jest.fn(async () => null),
+  findByIdAndDelete: jest.fn(async () => null),
+  findOneAndUpdate: jest.fn(async () => null),
+  countDocuments: jest.fn(async () => 0)
+};
+
+const User = {
+  findOne: jest.fn((q) => {
+    const email = q.email;
+    const user = Object.values(localUsers).find(u => u.email === email);
+    return makeQueryChain(user ? { toObject: () => user, ...user } : null);
+  }),
+  findById: jest.fn((id) => {
     const user = localUsers[id];
-    if (user) {
-      const { password_hash, ...returnedUser } = user;
-      return { rows: [returnedUser] };
+    return makeQueryChain(user ? { toObject: () => user, ...user } : null);
+  }),
+  create: jest.fn(async (data) => {
+    const user = { ...data, _id: data._id };
+    localUsers[user._id] = user;
+    return { toObject: () => user, ...user };
+  })
+};
+
+const Wallet = {
+  findOne: jest.fn((q) => {
+    const userId = q.userId;
+    const wallet = Object.values(localWallets).find(w => w.userId === userId);
+    return makeQueryChain(wallet ? { toObject: () => wallet, ...wallet } : null);
+  }),
+  findById: jest.fn((id) => {
+    const wallet = localWallets[id];
+    return makeQueryChain(wallet ? { toObject: () => wallet, ...wallet } : null);
+  }),
+  create: jest.fn(async (data) => {
+    const wallet = data[0];
+    localWallets[wallet._id] = wallet;
+    return [{ toObject: () => wallet, ...wallet }];
+  })
+};
+
+const LedgerAccount = {
+  findOne: jest.fn((q) => {
+    const holderType = q.holderType;
+    const holderId = q.holderId;
+    const account = Object.values(localLedgerAccounts).find(
+      a => a.holderType === holderType && a.holderId === holderId
+    );
+    return makeQueryChain(account ? { toObject: () => account, ...account } : null);
+  }),
+  create: jest.fn(async (data) => {
+    const account = data[0];
+    localLedgerAccounts[account._id] = account;
+    return [{ toObject: () => account, ...account }];
+  })
+};
+
+const LedgerTransaction = {
+  create: jest.fn(async (data) => {
+    const tx = data[0];
+    localLedgerTransactions[tx._id] = tx;
+    return [{ toObject: () => tx, ...tx }];
+  })
+};
+
+const LedgerEntry = {
+  create: jest.fn(async (data) => {
+    for (const entry of data) {
+      localLedgerEntries[entry.ledgerAccountId] = entry;
     }
-    return { rows: [] };
-  }
+    return data;
+  })
+};
 
-  if (text.includes('INSERT INTO users')) {
-    const user = {
-      id: 1,
-      first_name: params[0],
-      last_name: params[1],
-      email: params[2],
-      password_hash: params[3],
-      role: params[4],
-      created_at: new Date().toISOString(),
-    };
-    localUsers[1] = user;
-    const { password_hash, ...returnedUser } = user;
-    return { rows: [returnedUser] };
-  }
+const Counter = {
+  getNextSequence
+};
 
-
-  if (text.includes('ledger_accounts')) {
-    return {
-      rows: [{
-        id: 999,
-        holder_type: text.includes('SYSTEM') ? 'SYSTEM' : 'CUSTOMER',
-        holder_id: params ? params[1] : null,
-      }]
-    };
-  }
-
-  // All other tables / helper queries return empty lists by default
-  return { rows: [] };
-});
-
-const mockConnect = jest.fn().mockResolvedValue({
-  query: mockQuery,
-  release: jest.fn(),
-});
-
-// Mock pg library before importing app
-jest.unstable_mockModule('pg', () => ({
+const mockModels = {
   __esModule: true,
-  Pool: jest.fn(() => ({
-    query: mockQuery,
-    connect: mockConnect,
-    on: jest.fn(),
-  })),
+  User,
+  Wallet,
+  LedgerAccount,
+  LedgerTransaction,
+  LedgerEntry,
+  Transfer: dummyModel,
+  Merchant: dummyModel,
+  MerchantApiKey: dummyModel,
+  Payment: dummyModel,
+  Refund: dummyModel,
+  WebhookEndpoint: dummyModel,
+  WebhookDelivery: dummyModel,
+  WebhookEvent: dummyModel,
+  IdempotencyRecord: dummyModel,
+  ReconciliationRun: dummyModel,
+  RiskAssessment: dummyModel,
+  Counter,
   default: {
-    Pool: jest.fn(() => ({
-      query: mockQuery,
-      connect: mockConnect,
-      on: jest.fn(),
-    })),
-  },
-}));
+    User,
+    Wallet,
+    LedgerAccount,
+    LedgerTransaction,
+    LedgerEntry,
+    Transfer: dummyModel,
+    Merchant: dummyModel,
+    MerchantApiKey: dummyModel,
+    Payment: dummyModel,
+    Refund: dummyModel,
+    WebhookEndpoint: dummyModel,
+    WebhookDelivery: dummyModel,
+    WebhookEvent: dummyModel,
+    IdempotencyRecord: dummyModel,
+    ReconciliationRun: dummyModel,
+    RiskAssessment: dummyModel,
+    Counter
+  }
+};
 
-// Mock mongo and redis config connections
+// Mock modules
+jest.unstable_mockModule('../database/models.js', () => mockModels);
+
 jest.unstable_mockModule('../config/mongodb.js', () => ({
   __esModule: true,
   connectMongoDB: jest.fn().mockResolvedValue(true),
@@ -84,22 +159,7 @@ jest.unstable_mockModule('../config/mongodb.js', () => ({
   default: jest.fn().mockResolvedValue(true),
 }));
 
-jest.unstable_mockModule('../config/redis.js', () => ({
-  __esModule: true,
-  redisClient: {
-    isOpen: true,
-    connect: jest.fn().mockResolvedValue(true),
-    ping: jest.fn().mockResolvedValue('PONG'),
-    on: jest.fn(),
-  },
-  connectRedis: jest.fn().mockResolvedValue(true),
-  testRedisConnection: jest.fn().mockResolvedValue(true),
-  default: {},
-}));
-
-// Dynamic import placeholders
 let app;
-let pool;
 let config;
 let protect;
 let restrictTo;
@@ -109,12 +169,8 @@ describe('Auth Integration Tests', () => {
   let mockPasswordHash;
 
   beforeAll(async () => {
-    // Dynamically import to ensure modules use the mocked databases
     const appModule = await import('../app.js');
     app = appModule.app;
-
-    const dbModule = await import('../config/db.js');
-    pool = dbModule.default;
 
     const configModule = await import('../config/config.js');
     config = configModule.config;
@@ -123,7 +179,6 @@ describe('Auth Integration Tests', () => {
     protect = authMiddleware.protect;
     restrictTo = authMiddleware.restrictTo;
 
-    // Register a test RBAC route once
     const authRoutesModule = await import('../modules/auth/routes.js');
     const authRouter = authRoutesModule.default;
     
@@ -133,19 +188,23 @@ describe('Auth Integration Tests', () => {
 
     mockPasswordHash = await bcrypt.hash('password123', 10);
     mockUser = {
-      id: 1,
-      first_name: 'John',
-      last_name: 'Doe',
+      _id: 1,
+      firstName: 'John',
+      lastName: 'Doe',
       email: 'john.doe@example.com',
-      password_hash: mockPasswordHash,
+      passwordHash: mockPasswordHash,
       role: 'CUSTOMER',
-      created_at: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
     };
   });
 
   afterEach(() => {
     localUsers = {};
-    mockQuery.mockClear();
+    localWallets = {};
+    localLedgerAccounts = {};
+    localLedgerTransactions = {};
+    localLedgerEntries = {};
+    localCounters = { users: 0, wallets: 0, ledger_accounts: 0 };
   });
 
   describe('POST /api/auth/register', () => {
@@ -168,7 +227,6 @@ describe('Auth Integration Tests', () => {
     });
 
     it('should fail registration if email already exists', async () => {
-      // Setup user in mock DB state
       localUsers[1] = mockUser;
 
       const res = await request(app)
@@ -216,7 +274,6 @@ describe('Auth Integration Tests', () => {
       expect(res.body.data.accessToken).toBeDefined();
       expect(res.body.data.user.email).toEqual('john.doe@example.com');
       
-      // Verify refresh cookie set
       const cookies = res.headers['set-cookie'];
       expect(cookies).toBeDefined();
       expect(cookies[0]).toContain('refreshToken=');

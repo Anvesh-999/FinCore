@@ -1,4 +1,4 @@
-import pool from '../../config/db.js';
+import { Payment, Refund, Transfer, Wallet, User, LedgerAccount, LedgerEntry, LedgerTransaction, ReconciliationRun } from '../../database/models.js';
 import { emitToRoom } from '../../config/socket.js';
 import logger from '../../middleware/logger.js';
 
@@ -8,39 +8,37 @@ export class ReconciliationService {
     const discrepancies = [];
 
     // 1. Gather counts of records checked
-    const { rows: countsRows } = await pool.query(`
-      SELECT 
-        (SELECT COUNT(*) FROM payments WHERE status = 'SUCCEEDED') AS payments_count,
-        (SELECT COUNT(*) FROM refunds WHERE status = 'SUCCEEDED') AS refunds_count,
-        (SELECT COUNT(*) FROM peer_transfers WHERE status = 'SUCCEEDED') AS transfers_count
-    `);
-    const totalPayments = parseInt(countsRows[0].payments_count, 10);
-    const totalRefunds = parseInt(countsRows[0].refunds_count, 10);
-    const totalTransfers = parseInt(countsRows[0].transfers_count, 10);
+    const totalPayments = await Payment.countDocuments({ status: 'SUCCEEDED' });
+    const totalRefunds = await Refund.countDocuments({ status: 'SUCCEEDED' });
+    const totalTransfers = await Transfer.countDocuments({ status: 'COMPLETED' });
 
     // 2. Check 1: Wallet vs Ledger Balance Mismatch
-    const walletBalanceQuery = `
-      SELECT w.id AS wallet_id, w.user_id, w.available_balance, w.pending_balance, u.email, u.role,
-             (
-               SELECT COALESCE(SUM(CASE WHEN e.direction = 'CREDIT' THEN e.amount ELSE -e.amount END), 0)
-               FROM ledger_entries e
-               JOIN ledger_accounts la ON e.ledger_account_id = la.id
-               WHERE la.holder_id = w.user_id AND la.holder_type = u.role
-             ) AS ledger_balance
-      FROM wallets w
-      JOIN users u ON w.user_id = u.id
-    `;
-    const { rows: walletBalances } = await pool.query(walletBalanceQuery);
-    for (const row of walletBalances) {
-      const dbBalance = BigInt(row.available_balance) + BigInt(row.pending_balance);
-      const ledgerBalance = BigInt(row.ledger_balance);
+    const wallets = await Wallet.find().lean();
+    for (const w of wallets) {
+      const user = await User.findById(w.userId).lean();
+      if (!user) continue;
+      
+      const la = await LedgerAccount.findOne({ holderId: w.userId, holderType: user.role }).lean();
+      let ledgerBalance = 0;
+      if (la) {
+        const entries = await LedgerEntry.find({ ledgerAccountId: la._id }).lean();
+        for (const e of entries) {
+          if (e.direction === 'CREDIT') {
+            ledgerBalance += e.amount;
+          } else {
+            ledgerBalance -= e.amount;
+          }
+        }
+      }
+      
+      const dbBalance = w.availableBalance + w.pendingBalance;
       if (dbBalance !== ledgerBalance) {
         discrepancies.push({
           type: 'BALANCE_MISMATCH',
-          description: `Wallet ID ${row.wallet_id} balance does not match ledger ledger logs. Wallet: ${dbBalance.toString()} Cents. Ledger: ${ledgerBalance.toString()} Cents.`,
+          description: `Wallet ID ${w._id} balance does not match ledger logs. Wallet: ${dbBalance} Cents. Ledger: ${ledgerBalance} Cents.`,
           details: {
-            walletId: row.wallet_id,
-            email: row.email,
+            walletId: w._id,
+            email: user.email,
             dbBalance: dbBalance.toString(),
             ledgerBalance: ledgerBalance.toString()
           }
@@ -49,125 +47,141 @@ export class ReconciliationService {
     }
 
     // 3. Check 2: Unbalanced Ledger Transactions (Credits != Debits)
-    const unbalancedTransactionsQuery = `
-      SELECT t.id AS transaction_id, t.reference_type, t.reference_id,
-             COALESCE(SUM(CASE WHEN e.direction = 'CREDIT' THEN e.amount ELSE 0 END), 0) AS credit_sum,
-             COALESCE(SUM(CASE WHEN e.direction = 'DEBIT' THEN e.amount ELSE 0 END), 0) AS debit_sum
-      FROM ledger_transactions t
-      JOIN ledger_entries e ON t.id = e.ledger_transaction_id
-      GROUP BY t.id, t.reference_type, t.reference_id
-      HAVING COALESCE(SUM(CASE WHEN e.direction = 'CREDIT' THEN e.amount ELSE 0 END), 0) != 
-             COALESCE(SUM(CASE WHEN e.direction = 'DEBIT' THEN e.amount ELSE 0 END), 0)
-    `;
-    const { rows: unbalancedTxs } = await pool.query(unbalancedTransactionsQuery);
-    for (const tx of unbalancedTxs) {
-      discrepancies.push({
-        type: 'UNBALANCED_LEDGER_TRANSACTION',
-        description: `Ledger transaction ID ${tx.transaction_id} is unbalanced. Credits: ${tx.credit_sum}. Debits: ${tx.debit_sum}.`,
-        details: {
-          transactionId: tx.transaction_id,
-          referenceType: tx.reference_type,
-          referenceId: tx.reference_id,
-          creditSum: tx.credit_sum.toString(),
-          debitSum: tx.debit_sum.toString()
+    const txs = await LedgerTransaction.find().lean();
+    for (const tx of txs) {
+      const entries = await LedgerEntry.find({ ledgerTransactionId: tx._id }).lean();
+      let creditSum = 0;
+      let debitSum = 0;
+      for (const e of entries) {
+        if (e.direction === 'CREDIT') {
+          creditSum += e.amount;
+        } else {
+          debitSum += e.amount;
         }
-      });
+      }
+      if (creditSum !== debitSum) {
+        discrepancies.push({
+          type: 'UNBALANCED_LEDGER_TRANSACTION',
+          description: `Ledger transaction ID ${tx._id} is unbalanced. Credits: ${creditSum}. Debits: ${debitSum}.`,
+          details: {
+            transactionId: tx._id,
+            referenceType: tx.referenceType,
+            referenceId: tx.referenceId,
+            creditSum: creditSum.toString(),
+            debitSum: debitSum.toString()
+          }
+        });
+      }
     }
 
     // 4. Check 3: Succeeded Payments Missing Ledger Records
-    const missingPaymentLedgerQuery = `
-      SELECT p.id AS payment_id, p.amount, p.merchant_id
-      FROM payments p
-      WHERE p.status = 'SUCCEEDED' AND NOT EXISTS (
-        SELECT 1 FROM ledger_transactions t 
-        WHERE t.reference_type = 'PAYMENT' AND t.reference_id = p.id
-      )
-    `;
-    const { rows: missingPaymentLedgers } = await pool.query(missingPaymentLedgerQuery);
-    for (const pay of missingPaymentLedgers) {
-      discrepancies.push({
-        type: 'MISSING_PAYMENT_LEDGER',
-        description: `Succeeded Payment ${pay.payment_id} does not have a registered ledger entry.`,
-        details: {
-          paymentId: pay.payment_id,
-          amount: pay.amount.toString()
-        }
-      });
+    const succeededPayments = await Payment.find({ status: 'SUCCEEDED' }).lean();
+    for (const p of succeededPayments) {
+      const exists = await LedgerTransaction.findOne({ referenceType: 'PAYMENT', referenceId: p._id }).lean();
+      if (!exists) {
+        discrepancies.push({
+          type: 'MISSING_PAYMENT_LEDGER',
+          description: `Succeeded Payment ${p._id} does not have a registered ledger entry.`,
+          details: {
+            paymentId: p._id,
+            amount: p.amount.toString()
+          }
+        });
+      }
     }
 
     // 5. Check 4: Succeeded Refunds Missing Ledger Records
-    const missingRefundLedgerQuery = `
-      SELECT r.id AS refund_id, r.amount, r.payment_id
-      FROM refunds r
-      WHERE r.status = 'SUCCEEDED' AND NOT EXISTS (
-        SELECT 1 FROM ledger_transactions t 
-        WHERE t.reference_type = 'REFUND' AND t.reference_id = r.id
-      )
-    `;
-    const { rows: missingRefundLedgers } = await pool.query(missingRefundLedgerQuery);
-    for (const ref of missingRefundLedgers) {
-      discrepancies.push({
-        type: 'MISSING_REFUND_LEDGER',
-        description: `Succeeded Refund ${ref.refund_id} does not have a registered ledger entry.`,
-        details: {
-          refundId: ref.refund_id,
-          amount: ref.amount.toString(),
-          paymentId: ref.payment_id
-        }
-      });
+    const succeededRefunds = await Refund.find({ status: 'SUCCEEDED' }).lean();
+    for (const r of succeededRefunds) {
+      const exists = await LedgerTransaction.findOne({ referenceType: 'REFUND', referenceId: r._id }).lean();
+      if (!exists) {
+        discrepancies.push({
+          type: 'MISSING_REFUND_LEDGER',
+          description: `Succeeded Refund ${r._id} does not have a registered ledger entry.`,
+          details: {
+            refundId: r._id,
+            amount: r.amount.toString(),
+            paymentId: r.paymentId
+          }
+        });
+      }
     }
 
-    // 6. Check 5: Succeeded Transfers Missing Ledger Records
-    const missingTransferLedgerQuery = `
-      SELECT pt.id AS transfer_id, pt.amount
-      FROM peer_transfers pt
-      WHERE pt.status = 'SUCCEEDED' AND NOT EXISTS (
-        SELECT 1 FROM ledger_transactions t 
-        WHERE t.reference_type = 'TRANSFER' AND t.reference_id = pt.id
-      )
-    `;
-    const { rows: missingTransferLedgers } = await pool.query(missingTransferLedgerQuery);
-    for (const tf of missingTransferLedgers) {
-      discrepancies.push({
-        type: 'MISSING_TRANSFER_LEDGER',
-        description: `Succeeded Transfer ${tf.transfer_id} does not have a registered ledger entry.`,
-        details: {
-          transferId: tf.transfer_id,
-          amount: tf.amount.toString()
-        }
-      });
+    // 6. Check 5: Completed Transfers Missing Ledger Records
+    const completedTransfers = await Transfer.find({ status: 'COMPLETED' }).lean();
+    for (const t of completedTransfers) {
+      const exists = await LedgerTransaction.findOne({ referenceType: 'TRANSFER', referenceId: t._id }).lean();
+      if (!exists) {
+        discrepancies.push({
+          type: 'MISSING_TRANSFER_LEDGER',
+          description: `Succeeded Transfer ${t._id} does not have a registered ledger entry.`,
+          details: {
+            transferId: t._id,
+            amount: t.amount.toString()
+          }
+        });
+      }
     }
 
     // Save run audit log
     const inconsistenciesFound = discrepancies.length;
     const runStatus = 'COMPLETED';
 
-    const insertQuery = `
-      INSERT INTO reconciliation_runs (run_date, status, total_payments_checked, total_refunds_checked, total_transfers_checked, inconsistencies_found, results)
-      VALUES (CURRENT_DATE, $1, $2, $3, $4, $5, $6::jsonb)
-      RETURNING *
-    `;
-    const { rows: runResult } = await pool.query(insertQuery, [
-      runStatus,
-      totalPayments,
-      totalRefunds,
-      totalTransfers,
+    const run = await ReconciliationRun.create({
+      status: runStatus,
+      totalPaymentsChecked: totalPayments,
+      totalRefundsChecked: totalRefunds,
+      totalTransfersChecked: totalTransfers,
       inconsistenciesFound,
-      JSON.stringify(discrepancies)
-    ]);
+      results: discrepancies
+    });
+
+    const runObj = {
+      id: run._id,
+      runDate: run.runDate,
+      run_date: run.runDate,
+      status: run.status,
+      totalPaymentsChecked: run.totalPaymentsChecked,
+      total_payments_checked: run.totalPaymentsChecked,
+      totalRefundsChecked: run.totalRefundsChecked,
+      total_refunds_checked: run.totalRefundsChecked,
+      totalTransfersChecked: run.totalTransfersChecked,
+      total_transfers_checked: run.totalTransfersChecked,
+      inconsistenciesFound: run.inconsistenciesFound,
+      inconsistencies_found: run.inconsistenciesFound,
+      results: run.results,
+      createdAt: run.createdAt,
+      created_at: run.createdAt
+    };
 
     logger.info(`Reconciliation run complete. status: ${runStatus}, Inconsistencies found: ${inconsistenciesFound}`);
 
     if (inconsistenciesFound > 0) {
-      emitToRoom('admin', 'reconciliation.alert', runResult[0]);
+      emitToRoom('admin', 'reconciliation.alert', runObj);
     }
 
-    return runResult[0];
+    return runObj;
   }
 
   async getRuns() {
-    const { rows } = await pool.query('SELECT * FROM reconciliation_runs ORDER BY created_at DESC');
-    return rows;
+    const list = await ReconciliationRun.find().sort({ createdAt: -1 }).lean();
+    return list.map(run => ({
+      id: run._id,
+      runDate: run.runDate,
+      run_date: run.runDate,
+      status: run.status,
+      totalPaymentsChecked: run.totalPaymentsChecked,
+      total_payments_checked: run.totalPaymentsChecked,
+      totalRefundsChecked: run.totalRefundsChecked,
+      total_refunds_checked: run.totalRefundsChecked,
+      totalTransfersChecked: run.totalTransfersChecked,
+      total_transfers_checked: run.totalTransfersChecked,
+      inconsistenciesFound: run.inconsistenciesFound,
+      inconsistencies_found: run.inconsistenciesFound,
+      results: run.results,
+      createdAt: run.createdAt,
+      created_at: run.createdAt
+    }));
   }
 }
 

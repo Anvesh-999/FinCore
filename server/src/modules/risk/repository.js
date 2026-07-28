@@ -1,45 +1,85 @@
-import pool from '../../config/db.js';
+import { RiskAssessment, Transfer, Payment, Wallet, User } from '../../database/models.js';
 
 export class RiskRepository {
+  formatAssessment(assessment) {
+    if (!assessment) return null;
+    return {
+      id: assessment._id,
+      transaction_type: assessment.transactionType,
+      transaction_id: assessment.transactionId,
+      risk_score: assessment.riskScore,
+      decision: assessment.decision,
+      rules_triggered: assessment.rulesTriggered || [],
+      created_at: assessment.createdAt
+    };
+  }
+
   async createAssessment({ id, transactionType, transactionId, riskScore, decision, rulesTriggered }) {
-    const query = `
-      INSERT INTO risk_assessments (id, transaction_type, transaction_id, risk_score, decision, rules_triggered)
-      VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-      RETURNING *
-    `;
-    const params = [id, transactionType, transactionId, riskScore, decision, JSON.stringify(rulesTriggered)];
-    const { rows } = await pool.query(query, params);
-    return rows[0];
+    const assessment = await RiskAssessment.create({
+      _id: id,
+      transactionType,
+      transactionId,
+      riskScore,
+      decision,
+      rulesTriggered
+    });
+    return this.formatAssessment(assessment.toObject());
   }
 
   async getAllAssessments() {
-    const query = `
-      SELECT r.*, 
-             -- If transfer, retrieve sender and recipient email
-             t.amount as transfer_amount,
-             t.currency as transfer_currency,
-             u_send.email as sender_email,
-             u_rec.email as recipient_email,
-             -- If payment, retrieve amount and merchant email
-             p.amount as payment_amount,
-             p.currency as payment_currency,
-             u_merch.email as merchant_email,
-             u_cust.email as customer_email
-      FROM risk_assessments r
-      LEFT JOIN peer_transfers t ON r.transaction_type = 'TRANSFER' AND r.transaction_id = t.id
-      LEFT JOIN wallets w_send ON t.sender_wallet_id = w_send.id
-      LEFT JOIN users u_send ON w_send.user_id = u_send.id
-      LEFT JOIN wallets w_rec ON t.recipient_wallet_id = w_rec.id
-      LEFT JOIN users u_rec ON w_rec.user_id = u_rec.id
+    const assessments = await RiskAssessment.find().sort({ createdAt: -1 }).lean();
+    const formatted = [];
+    
+    for (const r of assessments) {
+      const item = this.formatAssessment(r);
       
-      LEFT JOIN payments p ON r.transaction_type = 'PAYMENT' AND r.transaction_id = p.id
-      LEFT JOIN users u_merch ON p.merchant_id = u_merch.id
-      LEFT JOIN wallets w_cust ON p.customer_wallet_id = w_cust.id
-      LEFT JOIN users u_cust ON w_cust.user_id = u_cust.id
-      ORDER BY r.created_at DESC
-    `;
-    const { rows } = await pool.query(query);
-    return rows;
+      if (r.transactionType === 'TRANSFER') {
+        const t = await Transfer.findById(r.transactionId).lean();
+        if (t) {
+          item.transfer_amount = t.amount;
+          item.transfer_currency = t.currency;
+          
+          const senderWallet = await Wallet.findById(t.senderWalletId).lean();
+          if (senderWallet) {
+            const senderUser = await User.findById(senderWallet.userId).lean();
+            if (senderUser) {
+              item.sender_email = senderUser.email;
+            }
+          }
+          
+          const recipientWallet = await Wallet.findById(t.recipientWalletId).lean();
+          if (recipientWallet) {
+            const recipientUser = await User.findById(recipientWallet.userId).lean();
+            if (recipientUser) {
+              item.recipient_email = recipientUser.email;
+            }
+          }
+        }
+      } else if (r.transactionType === 'PAYMENT') {
+        const p = await Payment.findById(r.transactionId).lean();
+        if (p) {
+          item.payment_amount = p.amount;
+          item.payment_currency = p.currency;
+          
+          const merchantUser = await User.findById(p.merchantId).lean();
+          if (merchantUser) {
+            item.merchant_email = merchantUser.email;
+          }
+          
+          if (p.customerWalletId) {
+            const customerWallet = await Wallet.findById(p.customerWalletId).lean();
+            if (customerWallet) {
+              const customerUser = await User.findById(customerWallet.userId).lean();
+              if (customerUser) {
+                item.customer_email = customerUser.email;
+              }
+            }
+          }
+        }
+      }
+      formatted.push(item);
+    }
+    return formatted;
   }
 }
 

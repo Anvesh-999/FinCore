@@ -8,13 +8,7 @@ const requiredEnv = [
   'PORT',
   'JWT_ACCESS_SECRET',
   'JWT_REFRESH_SECRET',
-  'PG_HOST',
-  'PG_PORT',
-  'PG_USER',
-  'PG_PASSWORD',
-  'PG_DATABASE',
   'MONGO_URI',
-  'REDIS_URL',
 ];
 
 const missingEnv = requiredEnv.filter((envVar) => !process.env[envVar]);

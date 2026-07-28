@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import pool from '../../config/db.js';
+import { Wallet } from '../../database/models.js';
 import walletRepository from '../wallets/repository.js';
 import transferRepository from './repository.js';
 import ledgerService from '../ledger/service.js';
@@ -12,11 +12,11 @@ import logger from '../../middleware/logger.js';
 export class TransferService {
   /**
    * Processes an atomic customer-to-customer peer transfer.
-   * Utilizes postgres transactions and ordered row locks to prevent deadlocks and double-spending.
+   * Utilizes MongoDB atomic checks to prevent double-spending and ensure consistency.
    */
   async createTransfer({ senderUserId, recipientEmail, amount, description = '', idempotencyKey = null }) {
-    const transferAmount = BigInt(amount);
-    if (transferAmount <= 0n) {
+    const transferAmount = Number(amount);
+    if (transferAmount <= 0) {
       throw new AppError('INVALID_AMOUNT', 'Transfer amount must be greater than zero', 400);
     }
 
@@ -34,49 +34,40 @@ export class TransferService {
       throw new AppError('INVALID_RECIPIENT', 'You cannot transfer funds to your own account', 400);
     }
 
-    // Connect DB client
-    const client = await pool.connect();
-    
+    // 2. Fetch wallets
+    const senderWallet = await walletRepository.findByUserId(senderUser.id);
+    const recipientWallet = await walletRepository.findByUserId(recipientUser.id);
+
+    if (!senderWallet) {
+      throw new AppError('WALLET_NOT_FOUND', 'Sender wallet could not be located', 404);
+    }
+    if (!recipientWallet) {
+      throw new AppError('WALLET_NOT_FOUND', 'Recipient wallet could not be located', 404);
+    }
+
+    // 3. Validate statuses
+    if (senderWallet.status !== 'ACTIVE') {
+      throw new AppError('WALLET_FROZEN', `Sender wallet is currently ${senderWallet.status}`, 400);
+    }
+    if (recipientWallet.status !== 'ACTIVE') {
+      throw new AppError('WALLET_FROZEN', `Recipient wallet is currently ${recipientWallet.status}`, 400);
+    }
+
+    // 4. Concurrency double-spend prevention using atomic conditional update
+    const senderWalletUpdate = await Wallet.findOneAndUpdate(
+      { _id: senderWallet.id, availableBalance: { $gte: transferAmount }, status: 'ACTIVE' },
+      { $inc: { availableBalance: -transferAmount }, $set: { updatedAt: new Date() } },
+      { new: true }
+    );
+
+    if (!senderWalletUpdate) {
+      throw new AppError('INSUFFICIENT_FUNDS', 'Your wallet does not have sufficient available funds', 400);
+    }
+
+    let transferId = null;
     try {
-      await client.query('BEGIN');
-
-      // 2. Fetch wallets
-      const senderWallet = await walletRepository.findByUserId(senderUser.id, client);
-      const recipientWallet = await walletRepository.findByUserId(recipientUser.id, client);
-
-      if (!senderWallet) {
-        throw new AppError('WALLET_NOT_FOUND', 'Sender wallet could not be located', 404);
-      }
-      if (!recipientWallet) {
-        throw new AppError('WALLET_NOT_FOUND', 'Recipient wallet could not be located', 404);
-      }
-
-      // 3. Acquire locks in ascending order of ID to prevent deadlock
-      const lockOrder = [senderWallet, recipientWallet].sort((a, b) => a.id - b.id);
-      
-      const lockedWallets = {};
-      for (const w of lockOrder) {
-        lockedWallets[w.id] = await walletRepository.lockWallet(w.id, client);
-      }
-
-      const lockedSenderWallet = lockedWallets[senderWallet.id];
-      const lockedRecipientWallet = lockedWallets[recipientWallet.id];
-
-      // 4. Validate statuses
-      if (lockedSenderWallet.status !== 'ACTIVE') {
-        throw new AppError('WALLET_FROZEN', `Sender wallet is currently ${lockedSenderWallet.status}`, 400);
-      }
-      if (lockedRecipientWallet.status !== 'ACTIVE') {
-        throw new AppError('WALLET_FROZEN', `Recipient wallet is currently ${lockedRecipientWallet.status}`, 400);
-      }
-
-      // 5. Check available balance
-      if (BigInt(lockedSenderWallet.available_balance) < transferAmount) {
-        throw new AppError('INSUFFICIENT_FUNDS', 'Your wallet does not have sufficient available funds', 400);
-      }
-
-      // 6. Create transfer record (status: PROCESSING)
-      const transferId = crypto.randomUUID();
+      // 5. Create transfer record (status: PROCESSING)
+      transferId = crypto.randomUUID();
       const transfer = await transferRepository.createTransfer({
         id: transferId,
         senderWalletId: senderWallet.id,
@@ -86,20 +77,20 @@ export class TransferService {
         status: 'PROCESSING',
         idempotencyKey,
         description,
-      }, client);
+      });
 
       // Run risk assessment check
       await riskService.checkTransactionRisk(senderWallet.id, 'TRANSFER', transferId, transferAmount.toString());
 
-      // 7. Resolve double-entry ledger accounts
-      const senderLedgerAccount = await ledgerService.findLedgerAccount('CUSTOMER', senderUser.id, client);
-      const recipientLedgerAccount = await ledgerService.findLedgerAccount('CUSTOMER', recipientUser.id, client);
+      // 6. Resolve double-entry ledger accounts
+      const senderLedgerAccount = await ledgerService.findLedgerAccount('CUSTOMER', senderUser.id);
+      const recipientLedgerAccount = await ledgerService.findLedgerAccount('CUSTOMER', recipientUser.id);
 
       if (!senderLedgerAccount || !recipientLedgerAccount) {
         throw new AppError('LEDGER_ACCOUNT_NOT_FOUND', 'Ledger accounts for transaction mapping could not be verified', 404);
       }
 
-      // 8. Post to double-entry ledger
+      // 7. Post to double-entry ledger
       await ledgerService.postTransaction({
         referenceType: 'TRANSFER',
         referenceId: transferId,
@@ -117,16 +108,14 @@ export class TransferService {
             currency: 'USD',
           }
         ]
-      }, client);
+      });
 
-      // 9. Update wallet balances
-      await walletRepository.updateBalances(senderWallet.id, -transferAmount, 0n, client);
-      await walletRepository.updateBalances(recipientWallet.id, transferAmount, 0n, client);
+      // 8. Update recipient wallet balance
+      await walletRepository.updateBalances(recipientWallet.id, transferAmount, 0);
 
-      // 10. Update transfer status (status: COMPLETED)
-      const completedTransfer = await transferRepository.updateTransferStatus(transferId, 'COMPLETED', client);
+      // 9. Update transfer status (status: COMPLETED)
+      const completedTransfer = await transferRepository.updateTransferStatus(transferId, 'COMPLETED');
 
-      await client.query('COMMIT');
       logger.info(`Transfer ${transferId} of ${transferAmount} cents completed from ${senderUser.email} to ${recipientUser.email}`);
       
       const payload = {
@@ -156,10 +145,15 @@ export class TransferService {
         createdAt: completedTransfer.created_at,
       };
     } catch (err) {
-      await client.query('ROLLBACK');
+      // Compensating action: revert the balance deduction from sender's wallet
+      await Wallet.findByIdAndUpdate(senderWallet.id, {
+        $inc: { availableBalance: transferAmount },
+        $set: { updatedAt: new Date() }
+      });
+      if (transferId) {
+        await transferRepository.updateTransferStatus(transferId, 'FAILED').catch(() => {});
+      }
       throw err;
-    } finally {
-      client.release();
     }
   }
 

@@ -1,11 +1,11 @@
 import crypto from 'crypto';
+import { Wallet } from '../../database/models.js';
 import refundRepository from './repository.js';
 import paymentRepository from '../payments/repository.js';
 import walletRepository from '../wallets/repository.js';
 import ledgerService from '../ledger/service.js';
 import webhookService from '../webhooks/service.js';
 import { emitToRoom } from '../../config/socket.js';
-import pool from '../../config/db.js';
 import { AppError } from '../../middleware/error.js';
 import logger from '../../middleware/logger.js';
 
@@ -15,67 +15,70 @@ export class RefundService {
       throw new AppError('VALIDATION_ERROR', 'Refund amount must be greater than zero', 400);
     }
 
-    const client = await pool.connect();
+    // 1. Fetch original payment order
+    const payment = await paymentRepository.findById(paymentId);
+    if (!payment) {
+      throw new AppError('PAYMENT_NOT_FOUND', 'Original payment order not found', 404);
+    }
+
+    // 2. Validate merchant ownership
+    if (payment.merchantId !== merchantId && payment.merchant_id !== merchantId) {
+      throw new AppError('UNAUTHORIZED', 'Merchant does not own this payment order', 401);
+    }
+
+    // 3. Verify payment is in refundable state
+    if (!['SUCCEEDED', 'PARTIALLY_REFUNDED'].includes(payment.status)) {
+      throw new AppError('PAYMENT_NOT_REFUNDABLE', `Payment in status ${payment.status} cannot be refunded`, 400);
+    }
+
+    // 4. Validate refund limits
+    const refundAmount = Number(amount);
+    const paymentAmount = Number(payment.amount);
+    const totalRefundedSoFar = Number(await refundRepository.getRefundsSumForPayment(paymentId));
+
+    if (totalRefundedSoFar + refundAmount > paymentAmount) {
+      throw new AppError(
+        'REFUND_EXCEEDS_PAYMENT',
+        `Refund amount exceeds captured payment limit. Max refundable remaining: ${paymentAmount - totalRefundedSoFar}`,
+        400
+      );
+    }
+
+    // 5. Fetch wallets
+    const merchantWallet = await walletRepository.findByUserId(merchantId);
+    if (!merchantWallet) {
+      throw new AppError('WALLET_NOT_FOUND', 'Merchant wallet not found', 404);
+    }
+
+    const customerWalletId = payment.customerWalletId || payment.customer_wallet_id;
+    const customerWallet = await walletRepository.findById(customerWalletId);
+    if (!customerWallet) {
+      throw new AppError('WALLET_NOT_FOUND', 'Customer wallet not found', 404);
+    }
+
+    // 6. Concurrency-safe atomic debit of merchant wallet
+    const merchantWalletUpdate = await Wallet.findOneAndUpdate(
+      { _id: merchantWallet.id, availableBalance: { $gte: refundAmount }, status: 'ACTIVE' },
+      { $inc: { availableBalance: -refundAmount }, $set: { updatedAt: new Date() } },
+      { new: true }
+    );
+
+    if (!merchantWalletUpdate) {
+      throw new AppError('INSUFFICIENT_FUNDS', 'Merchant wallet does not have sufficient available funds to issue refund', 400);
+    }
+
+    let refundId = null;
     try {
-      await client.query('BEGIN');
-
-      // 1. Fetch & lock original payment order
-      const payment = await paymentRepository.lockPayment(paymentId, client);
-      if (!payment) {
-        throw new AppError('PAYMENT_NOT_FOUND', 'Original payment order not found', 404);
-      }
-
-      // 2. Validate merchant ownership
-      if (payment.merchant_id !== merchantId) {
-        throw new AppError('UNAUTHORIZED', 'Merchant does not own this payment order', 401);
-      }
-
-      // 3. Verify payment is in refundable state
-      if (!['SUCCEEDED', 'PARTIALLY_REFUNDED'].includes(payment.status)) {
-        throw new AppError('PAYMENT_NOT_REFUNDABLE', `Payment in status ${payment.status} cannot be refunded`, 400);
-      }
-
-      // 4. Validate refund limits
-      const refundAmount = BigInt(amount);
-      const paymentAmount = BigInt(payment.amount);
-      const totalRefundedSoFar = await refundRepository.getRefundsSumForPayment(paymentId, client);
-
-      if (totalRefundedSoFar + refundAmount > paymentAmount) {
-        throw new AppError(
-          'REFUND_EXCEEDS_PAYMENT',
-          `Refund amount exceeds captured payment limit. Max refundable remaining: ${paymentAmount - totalRefundedSoFar}`,
-          400
-        );
-      }
-
-      // 5. Fetch and lock wallets
-      const merchantWallet = await walletRepository.findByUserId(merchantId);
-      if (!merchantWallet) {
-        throw new AppError('WALLET_NOT_FOUND', 'Merchant wallet not found', 404);
-      }
-      await walletRepository.lockWallet(merchantWallet.id, client);
-
-      // Verify merchant has sufficient funds to issue the refund
-      if (BigInt(merchantWallet.available_balance) < refundAmount) {
-        throw new AppError('INSUFFICIENT_FUNDS', 'Merchant wallet does not have sufficient available funds to issue refund', 400);
-      }
-
-      const customerWallet = await walletRepository.findById(payment.customer_wallet_id);
-      if (!customerWallet) {
-        throw new AppError('WALLET_NOT_FOUND', 'Customer wallet not found', 404);
-      }
-      await walletRepository.lockWallet(customerWallet.id, client);
-
-      // 6. Fetch ledger accounts
-      const merchantLedgerAccount = await ledgerService.findLedgerAccount('MERCHANT', merchantId, client);
-      const customerLedgerAccount = await ledgerService.findLedgerAccount('CUSTOMER', customerWallet.user_id, client);
+      // 7. Fetch ledger accounts
+      const merchantLedgerAccount = await ledgerService.findLedgerAccount('MERCHANT', merchantId);
+      const customerLedgerAccount = await ledgerService.findLedgerAccount('CUSTOMER', customerWallet.user_id);
       if (!merchantLedgerAccount || !customerLedgerAccount) {
         throw new AppError('LEDGER_ACCOUNT_NOT_FOUND', 'Ledger accounts are not initialized', 400);
       }
 
-      const refundId = 'ref_' + crypto.randomUUID();
+      refundId = 'ref_' + crypto.randomUUID();
       
-      // 7. Create processing refund record
+      // 8. Create processing refund record
       await refundRepository.createRefund({
         id: refundId,
         paymentId,
@@ -83,13 +86,12 @@ export class RefundService {
         currency: payment.currency,
         status: 'PROCESSING',
         description
-      }, client);
+      });
 
-      // 8. Revert balances: Debit Merchant, Credit Customer
-      await walletRepository.updateBalances(merchantWallet.id, -refundAmount, 0n, client);
-      await walletRepository.updateBalances(customerWallet.id, refundAmount, 0n, client);
+      // 9. Update customer wallet balance
+      await walletRepository.updateBalances(customerWallet.id, refundAmount, 0);
 
-      // 9. Post compensating balanced ledger transaction
+      // 10. Post compensating balanced ledger transaction
       await ledgerService.postTransaction({
         referenceType: 'REFUND',
         referenceId: refundId,
@@ -107,16 +109,15 @@ export class RefundService {
             currency: payment.currency,
           }
         ]
-      }, client);
+      });
 
-      // 10. Update refund status to SUCCEEDED
-      const succeededRefund = await refundRepository.updateRefundStatus(refundId, 'SUCCEEDED', client);
+      // 11. Update refund status to SUCCEEDED
+      const succeededRefund = await refundRepository.updateRefundStatus(refundId, 'SUCCEEDED');
 
-      // 11. Calculate new payment status (REFUNDED vs PARTIALLY_REFUNDED)
+      // 12. Calculate new payment status (REFUNDED vs PARTIALLY_REFUNDED)
       const newStatus = (totalRefundedSoFar + refundAmount === paymentAmount) ? 'REFUNDED' : 'PARTIALLY_REFUNDED';
-      await paymentRepository.updatePaymentStatus(paymentId, newStatus, null, client);
+      await paymentRepository.updatePaymentStatus(paymentId, newStatus, null);
 
-      await client.query('COMMIT');
       logger.info(`Refund succeeded for payment ${paymentId}. ID: ${refundId}. Merchant wallet debited ${refundAmount}, Customer wallet credited.`);
 
       // Trigger webhook event
@@ -132,10 +133,15 @@ export class RefundService {
 
       return formatted;
     } catch (err) {
-      await client.query('ROLLBACK');
+      // Reversal compensating update: credit back the merchant wallet
+      await Wallet.findByIdAndUpdate(merchantWallet.id, {
+        $inc: { availableBalance: refundAmount },
+        $set: { updatedAt: new Date() }
+      });
+      if (refundId) {
+        await refundRepository.updateRefundStatus(refundId, 'FAILED').catch(() => {});
+      }
       throw err;
-    } finally {
-      client.release();
     }
   }
 
@@ -179,13 +185,13 @@ export class RefundService {
   formatRefund(r) {
     return {
       id: r.id,
-      paymentId: r.payment_id,
+      paymentId: r.payment_id || r.paymentId,
       amount: r.amount.toString(),
       currency: r.currency,
       status: r.status,
       description: r.description,
-      createdAt: r.created_at,
-      updatedAt: r.updated_at
+      createdAt: r.created_at || r.createdAt,
+      updatedAt: r.updated_at || r.updatedAt
     };
   }
 }

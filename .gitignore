@@ -38,3 +38,7 @@ coverage/
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Custom excludes
+.env.example
+PRD.md

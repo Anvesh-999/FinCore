@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import webhookRepository from './repository.js';
 import rabbitMQManager from '../../config/rabbitmq.js';
+import { WebhookDelivery } from '../../database/models.js';
 import { AppError } from '../../middleware/error.js';
 import logger from '../../middleware/logger.js';
 
@@ -189,32 +190,20 @@ export class WebhookService {
       }
     }
   }
-
   // --- Manual Retry Intervention ---
   async retryWebhookDelivery(merchantId, deliveryId) {
-    // Find delivery
-    const query = `
-      SELECT d.*, e.merchant_id 
-      FROM webhook_deliveries d
-      JOIN webhook_events e ON d.webhook_event_id = e.id
-      WHERE d.id = $1
-    `;
-    const { rows } = await pool.query(query, [deliveryId]);
-    const delivery = rows[0];
-
-    if (!delivery || delivery.merchant_id !== merchantId) {
+    const delivery = await WebhookDelivery.findById(deliveryId).lean();
+    if (!delivery || delivery.merchantId !== Number(merchantId)) {
       throw new AppError('NOT_FOUND', 'Webhook delivery history record not found', 404);
     }
 
-    const event = await webhookRepository.findWebhookEventById(delivery.webhook_event_id);
-    const endpoint = await webhookRepository.findEndpointById(delivery.webhook_endpoint_id);
+    const event = await webhookRepository.findWebhookEventById(delivery.eventId);
+    const endpoint = await webhookRepository.findEndpointById(delivery.endpointId);
 
     if (!event || !endpoint) {
       throw new AppError('NOT_FOUND', 'Original event or endpoint details have been deleted', 404);
     }
 
-    // Trigger immediate delivery attempt (as attempt number 1)
-    // Run asynchronously to allow instant UI response
     this.deliverToEndpoint(event, endpoint, 1);
     return { success: true, message: 'Retry attempt scheduled' };
   }

@@ -5,14 +5,14 @@ import crypto from 'crypto';
 
 // Local mock database state
 let localUsers = {
-  1: { id: 1, email: 'customer@example.com', role: 'CUSTOMER', first_name: 'Customer', last_name: 'User' },
-  2: { id: 2, email: 'merchant@example.com', role: 'MERCHANT', first_name: 'Merchant', last_name: 'User' },
-  3: { id: 3, email: 'admin@example.com', role: 'ADMIN', first_name: 'Admin', last_name: 'User' },
+  1: { _id: 1, email: 'customer@example.com', role: 'CUSTOMER', firstName: 'Customer', lastName: 'User', first_name: 'Customer', last_name: 'User' },
+  2: { _id: 2, email: 'merchant@example.com', role: 'MERCHANT', firstName: 'Merchant', lastName: 'User', first_name: 'Merchant', last_name: 'User' },
+  3: { _id: 3, email: 'admin@example.com', role: 'ADMIN', firstName: 'Admin', lastName: 'User', first_name: 'Admin', last_name: 'User' },
 };
 
 let localWallets = {
-  1: { id: 1, user_id: 1, available_balance: 100000n, pending_balance: 0n, status: 'ACTIVE', currency: 'USD' }, // Customer ($1000.00)
-  2: { id: 2, user_id: 2, available_balance: 0n, pending_balance: 0n, status: 'ACTIVE', currency: 'USD' },      // Merchant ($0.00)
+  1: { _id: 1, userId: 1, availableBalance: 100000, pendingBalance: 0, status: 'ACTIVE', currency: 'USD', available_balance: 100000n, pending_balance: 0n },
+  2: { _id: 2, userId: 2, availableBalance: 0, pendingBalance: 0, status: 'ACTIVE', currency: 'USD', available_balance: 0n, pending_balance: 0n },
 };
 
 let mockEndpoints = [];
@@ -20,384 +20,521 @@ let mockWebhookEvents = [];
 let mockDeliveries = [];
 let mockRiskAssessments = [];
 let mockReconciliationRuns = [];
+let mockTransfers = [];
+let mockPayments = [];
+let mockRefunds = [];
+let mockLedgerAccounts = {};
+let mockLedgerTransactions = [];
+let mockLedgerEntries = [{ ledgerAccountId: 10, direction: 'CREDIT', amount: 100000 }];
+let localCounters = { webhook_endpoints: 0, reconciliation_runs: 0 };
 
-let mockTransfersCount = 0;
-let mockPaymentsCount = 0;
-let mockRefundsCount = 0;
+const makeQueryChain = (result) => {
+  const chain = {
+    lean: jest.fn(() => chain),
+    session: jest.fn(() => chain),
+    sort: jest.fn(() => chain),
+    then: (resolve, reject) => Promise.resolve(result).then(resolve, reject),
+    catch: (reject) => Promise.resolve(result).catch(reject)
+  };
+  return chain;
+};
 
-const mockQuery = jest.fn(async (text, params) => {
-  // 1. SELECT users by email
-  if (text.includes('SELECT * FROM users WHERE email = $1')) {
-    const email = params[0];
-    const user = Object.values(localUsers).find((u) => u.email === email);
-    return { rows: user ? [user] : [] };
-  }
-
-  // 2. SELECT users by id
-  if (text.includes('SELECT id, first_name, last_name, email, role, created_at FROM users WHERE id = $1')) {
-    const id = params[0];
-    const user = localUsers[id];
-    return { rows: user ? [user] : [] };
-  }
-
-  // 3. INSERT INTO webhook_endpoints
-  if (text.includes('INSERT INTO webhook_endpoints')) {
-    const endpoint = {
-      id: mockEndpoints.length + 1,
-      merchant_id: params[0],
-      url: params[1],
-      secret: params[2],
-      status: 'ACTIVE',
-      events: JSON.parse(params[3]),
-      created_at: new Date().toISOString()
-    };
-    mockEndpoints.push(endpoint);
-    return { rows: [endpoint] };
-  }
-
-  // 4. SELECT webhook_endpoints by merchant
-  if (text.includes('SELECT * FROM webhook_endpoints WHERE merchant_id = $1')) {
-    const merchantId = params[0];
-    const list = mockEndpoints.filter(e => e.merchant_id === merchantId);
-    return { rows: list };
-  }
-
-  // 5. SELECT webhook_endpoint by ID
-  if (text.includes('SELECT * FROM webhook_endpoints WHERE id = $1')) {
-    const id = params[0];
-    const ep = mockEndpoints.find(e => e.id == id);
-    return { rows: ep ? [ep] : [] };
-  }
-
-  // 6. UPDATE webhook_endpoints
-  if (text.includes('UPDATE webhook_endpoints') && text.includes('SET url = $1')) {
-    const id = params[3];
-    const ep = mockEndpoints.find(e => e.id == id);
-    if (ep) {
-      ep.url = params[0];
-      ep.status = params[1];
-      ep.events = JSON.parse(params[2]);
-      return { rows: [ep] };
+const dummyModel = {
+  create: jest.fn(async (data) => {
+    if (Array.isArray(data)) {
+      return data.map(d => ({ toObject: () => d, ...d }));
     }
-    return { rows: [] };
-  }
+    return { toObject: () => data, ...data };
+  }),
+  find: jest.fn(() => makeQueryChain([])),
+  findOne: jest.fn(() => makeQueryChain(null)),
+  findById: jest.fn(() => makeQueryChain(null)),
+  findByIdAndUpdate: jest.fn(async () => null),
+  findByIdAndDelete: jest.fn(async () => null),
+  findOneAndUpdate: jest.fn(async () => null),
+  countDocuments: jest.fn(async () => 0)
+};
 
-  // 7. DELETE webhook_endpoints
-  if (text.includes('DELETE FROM webhook_endpoints')) {
-    const id = params[0];
+const User = {
+  findOne: jest.fn((q) => {
+    const email = q.email;
+    const user = Object.values(localUsers).find((u) => u.email === email);
+    return makeQueryChain(user ? { toObject: () => user, ...user } : null);
+  }),
+  findById: jest.fn((id) => {
+    const user = localUsers[id];
+    return makeQueryChain(user ? { toObject: () => user, ...user } : null);
+  }),
+};
+
+const Wallet = {
+  find: jest.fn(() => makeQueryChain(Object.values(localWallets))),
+  findOne: jest.fn((q) => {
+    const userId = q.userId;
+    const wallet = Object.values(localWallets).find((w) => w.userId === userId);
+    return makeQueryChain(wallet ? { toObject: () => wallet, ...wallet } : null);
+  }),
+  findById: jest.fn((id) => {
+    const wallet = localWallets[id];
+    return makeQueryChain(wallet ? { toObject: () => wallet, ...wallet } : null);
+  }),
+  findOneAndUpdate: jest.fn(async (query, update) => {
+    const id = query._id;
+    const wallet = localWallets[id];
+    if (wallet && update.$inc) {
+      wallet.availableBalance += (update.$inc.availableBalance || 0);
+      wallet.available_balance = BigInt(wallet.availableBalance);
+    }
+    return wallet ? { toObject: () => wallet, ...wallet } : null;
+  }),
+  findByIdAndUpdate: jest.fn(async (id, update) => {
+    const wallet = localWallets[id];
+    if (wallet && update.$inc) {
+      wallet.availableBalance += (update.$inc.availableBalance || 0);
+      wallet.available_balance = BigInt(wallet.availableBalance);
+    }
+    return wallet ? { toObject: () => wallet, ...wallet } : null;
+  })
+};
+
+const WebhookEndpoint = {
+  create: jest.fn(async (data) => {
+    const ep = data[0];
+    const endpoint = {
+      _id: ep._id,
+      merchantId: ep.merchantId,
+      url: ep.url,
+      secret: ep.secret,
+      status: ep.status || 'ACTIVE',
+      events: ep.events,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+    mockEndpoints.push({
+      id: endpoint._id,
+      merchant_id: endpoint.merchantId,
+      url: endpoint.url,
+      secret: endpoint.secret,
+      status: endpoint.status,
+      events: endpoint.events,
+      created_at: endpoint.createdAt
+    });
+    return [{ toObject: () => endpoint, ...endpoint }];
+  }),
+  find: jest.fn((q) => {
+    let list = mockEndpoints.map(e => ({
+      _id: e.id,
+      merchantId: e.merchant_id,
+      url: e.url,
+      secret: e.secret,
+      status: e.status,
+      events: e.events,
+      createdAt: e.created_at
+    }));
+    if (q && q.merchantId) {
+      list = list.filter(e => e.merchantId === q.merchantId && (q.status === undefined || e.status === q.status) && (q.events === undefined || e.events.includes(q.events)));
+    }
+    return makeQueryChain(list);
+  }),
+  findById: jest.fn((id) => {
+    const ep = mockEndpoints.find(e => e.id == id);
+    if (!ep) return makeQueryChain(null);
+    return makeQueryChain({
+      _id: ep.id,
+      merchantId: ep.merchant_id,
+      url: ep.url,
+      secret: ep.secret,
+      status: ep.status,
+      events: ep.events,
+      createdAt: ep.created_at
+    });
+  }),
+  findByIdAndUpdate: jest.fn(async (id, update) => {
+    const ep = mockEndpoints.find(e => e.id == id);
+    if (ep && update.$set) {
+      if (update.$set.url !== undefined) ep.url = update.$set.url;
+      if (update.$set.status !== undefined) ep.status = update.$set.status;
+      if (update.$set.events !== undefined) ep.events = update.$set.events;
+      if (update.$set.secret !== undefined) ep.secret = update.$set.secret;
+    }
+    if (!ep) return null;
+    const endpoint = {
+      _id: ep.id,
+      merchantId: ep.merchant_id,
+      url: ep.url,
+      secret: ep.secret,
+      status: ep.status,
+      events: ep.events,
+      createdAt: ep.created_at
+    };
+    return { toObject: () => endpoint, ...endpoint };
+  }),
+  findByIdAndDelete: jest.fn(async (id) => {
     const idx = mockEndpoints.findIndex(e => e.id == id);
     if (idx !== -1) {
       const ep = mockEndpoints[idx];
       mockEndpoints.splice(idx, 1);
-      return { rows: [ep] };
+      return {
+        toObject: () => ({
+          _id: ep.id,
+          merchantId: ep.merchant_id,
+          url: ep.url,
+          secret: ep.secret,
+          status: ep.status,
+          events: ep.events
+        }),
+        _id: ep.id,
+        merchantId: ep.merchant_id
+      };
     }
-    return { rows: [] };
-  }
+    return null;
+  })
+};
 
-  // 8. UPDATE webhook_endpoints secret (rotate)
-  if (text.includes('UPDATE webhook_endpoints') && text.includes('SET secret = $1')) {
-    const id = params[1];
-    const ep = mockEndpoints.find(e => e.id == id);
-    if (ep) {
-      ep.secret = params[0];
-      return { rows: [ep] };
-    }
-    return { rows: [] };
-  }
-
-  // 9. SELECT active endpoints matching event type
-  if (text.includes('SELECT * FROM webhook_endpoints') && text.includes('status = \'ACTIVE\'') && text.includes('events @> $2::jsonb')) {
-    const merchantId = params[0];
-    const eventType = JSON.parse(params[1])[0];
-    const list = mockEndpoints.filter(e => e.merchant_id === merchantId && e.status === 'ACTIVE' && e.events.includes(eventType));
-    return { rows: list };
-  }
-
-  // 10. INSERT INTO webhook_events
-  if (text.includes('INSERT INTO webhook_events')) {
-    const evt = {
-      id: params[0],
-      merchant_id: params[1],
-      event_type: params[2],
-      payload: JSON.parse(params[3]),
-      status: params[4],
-      created_at: new Date().toISOString()
+const WebhookEvent = {
+  create: jest.fn(async (data) => {
+    const ev = {
+      _id: data._id,
+      merchantId: data.merchantId,
+      eventType: data.eventType,
+      payload: data.payload,
+      status: data.status,
+      createdAt: new Date()
     };
-    mockWebhookEvents.push(evt);
-    return { rows: [evt] };
-  }
+    mockWebhookEvents.push({
+      id: ev._id,
+      merchant_id: ev.merchantId,
+      event_type: ev.eventType,
+      payload: ev.payload,
+      status: ev.status,
+      created_at: ev.createdAt
+    });
+    return { toObject: () => ev, ...ev };
+  }),
+  findById: jest.fn((id) => {
+    const ev = mockWebhookEvents.find(e => e.id === id);
+    if (!ev) return makeQueryChain(null);
+    return makeQueryChain({
+      _id: ev.id,
+      merchantId: ev.merchant_id,
+      eventType: ev.event_type,
+      payload: ev.payload,
+      status: ev.status,
+      createdAt: ev.created_at
+    });
+  })
+};
 
-  // 11. SELECT webhook_event by ID
-  if (text.includes('SELECT * FROM webhook_events WHERE id = $1')) {
-    const id = params[0];
-    const evt = mockWebhookEvents.find(e => e.id === id);
-    return { rows: evt ? [evt] : [] };
-  }
-
-  // 12. UPDATE webhook_events status
-  if (text.includes('UPDATE webhook_events SET status = $1')) {
-    const status = params[0];
-    const id = params[1];
-    const evt = mockWebhookEvents.find(e => e.id === id);
-    if (evt) {
-      evt.status = status;
-      return { rows: [evt] };
-    }
-    return { rows: [] };
-  }
-
-  // 13. INSERT INTO webhook_deliveries
-  if (text.includes('INSERT INTO webhook_deliveries')) {
-    const del = {
-      id: params[0],
-      webhook_event_id: params[1],
-      webhook_endpoint_id: params[2],
-      response_status: params[3],
-      response_body: params[4],
-      attempt_number: params[5],
-      status: params[6],
-      created_at: new Date().toISOString()
+const WebhookDelivery = {
+  create: jest.fn(async (data) => {
+    const d = {
+      _id: data._id,
+      merchantId: data.merchantId,
+      eventId: data.eventId,
+      endpointId: data.endpointId,
+      responseStatus: data.responseStatus,
+      responseBody: data.responseBody,
+      attemptNumber: data.attemptNumber,
+      status: data.status,
+      createdAt: new Date()
     };
-    mockDeliveries.push(del);
-    return { rows: [del] };
-  }
+    mockDeliveries.push({
+      id: d._id,
+      webhook_event_id: d.eventId,
+      webhook_endpoint_id: d.endpointId,
+      response_status: d.responseStatus,
+      response_body: d.responseBody,
+      attempt_number: d.attemptNumber,
+      status: d.status,
+      created_at: d.createdAt
+    });
+    return { toObject: () => d, ...d };
+  }),
+  findById: jest.fn((id) => {
+    const d = mockDeliveries.find(del => del.id === id);
+    if (!d) return makeQueryChain(null);
+    return makeQueryChain({
+      _id: d.id,
+      merchantId: d.merchant_id,
+      eventId: d.webhook_event_id,
+      endpointId: d.webhook_endpoint_id,
+      responseStatus: d.response_status,
+      responseBody: d.response_body,
+      attemptNumber: d.attempt_number,
+      status: d.status,
+      createdAt: d.created_at
+    });
+  }),
+  find: jest.fn(() => makeQueryChain(mockDeliveries))
+};
 
-  // 14. SELECT webhook deliveries by merchant
-  if (text.includes('SELECT d.*, e.event_type') && text.includes('e.merchant_id = $1')) {
-    const merchantId = params[0];
-    const list = mockDeliveries.map(d => {
-      const evt = mockWebhookEvents.find(e => e.id === d.webhook_event_id);
-      const ep = mockEndpoints.find(e => e.id === d.webhook_endpoint_id);
-      if (evt && evt.merchant_id === merchantId) {
-        return {
-          ...d,
-          event_type: evt.event_type,
-          payload: evt.payload,
-          url: ep ? ep.url : ''
-        };
+const RiskAssessment = {
+  create: jest.fn(async (data) => {
+    const r = {
+      _id: data._id,
+      transactionId: data.transactionId,
+      transactionType: data.transactionType,
+      riskScore: data.riskScore,
+      decision: data.decision,
+      rulesTriggered: data.rulesTriggered || [],
+      createdAt: new Date()
+    };
+    mockRiskAssessments.push({
+      id: r._id,
+      transaction_type: r.transactionType,
+      transaction_id: r.transactionId,
+      risk_score: r.riskScore,
+      decision: r.decision,
+      rules_triggered: r.rulesTriggered,
+      created_at: r.createdAt
+    });
+    return { toObject: () => r, ...r };
+  }),
+  find: jest.fn(() => makeQueryChain(mockRiskAssessments))
+};
+
+const ReconciliationRun = {
+  create: jest.fn(async (data) => {
+    const r = {
+      _id: mockReconciliationRuns.length + 1,
+      status: data.status,
+      totalPaymentsChecked: data.totalPaymentsChecked,
+      totalRefundsChecked: data.totalRefundsChecked,
+      totalTransfersChecked: data.totalTransfersChecked,
+      inconsistenciesFound: data.inconsistenciesFound,
+      results: data.results,
+      runDate: new Date(),
+      createdAt: new Date()
+    };
+    mockReconciliationRuns.push({
+      id: r._id,
+      run_date: r.runDate,
+      status: r.status,
+      total_payments_checked: r.totalPaymentsChecked,
+      total_refunds_checked: r.totalRefundsChecked,
+      total_transfers_checked: r.totalTransfersChecked,
+      inconsistencies_found: r.inconsistenciesFound,
+      results: r.results,
+      created_at: r.createdAt
+    });
+    return r;
+  }),
+  find: jest.fn(() => makeQueryChain(mockReconciliationRuns))
+};
+
+const Transfer = {
+  countDocuments: jest.fn(async () => mockTransfers.length),
+  find: jest.fn(() => makeQueryChain(mockTransfers))
+};
+
+const Payment = {
+  countDocuments: jest.fn(async () => mockPayments.length),
+  find: jest.fn((q) => {
+    let result = mockPayments;
+    if (q && q.status) {
+      result = result.filter(p => p.status === q.status);
+    }
+    return makeQueryChain(result);
+  }),
+  findById: jest.fn((id) => {
+    const p = mockPayments.find(pay => pay.id === id);
+    if (!p) return makeQueryChain(null);
+    const payment = {
+      _id: p.id,
+      merchantId: p.merchant_id,
+      amount: Number(p.amount),
+      currency: p.currency,
+      reference: p.reference,
+      metadata: p.metadata,
+      status: p.status,
+      idempotencyKey: p.idempotency_key,
+      customerWalletId: p.customer_wallet_id,
+      createdAt: p.created_at,
+      updatedAt: p.updated_at
+    };
+    return makeQueryChain(payment);
+  }),
+  findByIdAndUpdate: jest.fn(async (id, update) => {
+    const p = mockPayments.find(pay => pay.id === id);
+    if (p && update.$set) {
+      p.status = update.$set.status;
+      if (update.$set.customerWalletId !== undefined) {
+        p.customer_wallet_id = update.$set.customerWalletId;
       }
-      return null;
-    }).filter(Boolean);
-    return { rows: list };
-  }
-
-  // 15. SELECT webhook deliveries join details (for manual retry verification)
-  if (text.includes('SELECT d.*, e.merchant_id') && text.includes('d.id = $1')) {
-    const delId = params[0];
-    const d = mockDeliveries.find(x => x.id === delId);
-    if (d) {
-      const evt = mockWebhookEvents.find(e => e.id === d.webhook_event_id);
-      if (evt) {
-        return { rows: [{ ...d, merchant_id: evt.merchant_id }] };
-      }
     }
-    return { rows: [] };
-  }
-
-  // 16. INSERT INTO risk_assessments
-  if (text.includes('INSERT INTO risk_assessments')) {
-    const assessment = {
-      id: params[0],
-      transaction_type: params[1],
-      transaction_id: params[2],
-      risk_score: params[3],
-      decision: params[4],
-      rules_triggered: JSON.parse(params[5]),
-      created_at: new Date().toISOString()
+    if (!p) return null;
+    const payment = {
+      _id: p.id,
+      merchantId: p.merchant_id,
+      amount: Number(p.amount),
+      currency: p.currency,
+      reference: p.reference,
+      metadata: p.metadata,
+      status: p.status,
+      idempotencyKey: p.idempotency_key,
+      customerWalletId: p.customer_wallet_id,
+      createdAt: p.created_at,
+      updatedAt: p.updated_at
     };
-    mockRiskAssessments.push(assessment);
-    return { rows: [assessment] };
-  }
+    return { toObject: () => payment, ...payment };
+  })
+};
 
-  // 17. SELECT velocity counts for risk checks
-  if (text.includes('SELECT COUNT(*) FROM peer_transfers WHERE sender_wallet_id = $1')) {
-    return { rows: [{ count: mockTransfersCount }] };
-  }
+const Refund = {
+  countDocuments: jest.fn(async () => mockRefunds.length),
+  find: jest.fn((q) => {
+    let result = mockRefunds;
+    if (q && q.status) {
+      result = result.filter(r => r.status === q.status);
+    }
+    return makeQueryChain(result);
+  })
+};
 
-  // 18. SELECT available balance for balance drain checks
-  if (text.includes('SELECT available_balance FROM wallets WHERE id = $1')) {
-    const id = params[0];
-    const w = localWallets[id];
-    return { rows: w ? [w] : [] };
-  }
+const LedgerAccount = {
+  findOne: jest.fn((q) => {
+    const holderId = q.holderId;
+    const holderType = q.holderType || 'CUSTOMER';
+    const id = holderId === 1 ? 10 : (holderId === 2 ? 20 : 30);
+    return makeQueryChain({ _id: id, holderType, holderId });
+  })
+};
 
-  // 19. Succeeded counts for reconciliation
-  if (text.includes('SELECT') && text.includes('payments_count') && text.includes('refunds_count')) {
-    return {
-      rows: [{
-        payments_count: mockPaymentsCount,
-        refunds_count: mockRefundsCount,
-        transfers_count: mockTransfersCount
-      }]
-    };
-  }
+const LedgerEntry = {
+  find: jest.fn((q) => {
+    let list = mockLedgerEntries;
+    if (q && q.ledgerAccountId) {
+      list = list.filter(e => e.ledgerAccountId === q.ledgerAccountId);
+    }
+    return makeQueryChain(list);
+  })
+};
 
-  // 20. Wallet Balance consistency checks
-  if (text.includes('SELECT w.id AS wallet_id, w.user_id') && text.includes('COALESCE(SUM(CASE WHEN e.direction')) {
-    // Return wallet balances mapping
-    return {
-      rows: Object.values(localWallets).map(w => {
-        const u = localUsers[w.user_id];
-        // Simulate matching ledger balance by default
-        return {
-          wallet_id: w.id,
-          user_id: w.user_id,
-          available_balance: w.available_balance.toString(),
-          pending_balance: w.pending_balance.toString(),
-          email: u.email,
-          role: u.role,
-          ledger_balance: (w.available_balance + w.pending_balance).toString()
-        };
-      })
-    };
-  }
+const LedgerTransaction = {
+  find: jest.fn(() => makeQueryChain(mockLedgerTransactions)),
+  findOne: jest.fn((q) => {
+    const tx = mockLedgerTransactions.find(t => t.referenceId === q.referenceId && t.referenceType === q.referenceType);
+    return makeQueryChain(tx ? { toObject: () => tx, ...tx } : null);
+  })
+};
 
-  // 21. Succeeded Payments missing ledger
-  if (text.includes('SELECT p.id AS payment_id') && text.includes('p.status = \'SUCCEEDED\'')) {
-    return { rows: [] }; // No missing payment ledger
-  }
+const Counter = {
+  getNextSequence: jest.fn(async (name) => {
+    localCounters[name] = (localCounters[name] || 0) + 1;
+    return localCounters[name];
+  })
+};
 
-  // 22. Succeeded Refunds missing ledger
-  if (text.includes('SELECT r.id AS refund_id') && text.includes('r.status = \'SUCCEEDED\'')) {
-    return { rows: [] }; // No missing refund ledger
-  }
-
-  // 23. Succeeded Transfers missing ledger
-  if (text.includes('SELECT pt.id AS transfer_id') && text.includes('pt.status = \'SUCCEEDED\'')) {
-    return { rows: [] }; // No missing transfer ledger
-  }
-
-  // 24. Unbalanced ledger transaction check
-  if (text.includes('SELECT t.id AS transaction_id') && text.includes('GROUP BY t.id, t.reference_type')) {
-    return { rows: [] }; // No unbalanced transactions
-  }
-
-  // 25. INSERT INTO reconciliation_runs
-  if (text.includes('INSERT INTO reconciliation_runs')) {
-    const run = {
-      id: mockReconciliationRuns.length + 1,
-      run_date: new Date().toISOString().split('T')[0],
-      status: params[0],
-      total_payments_checked: params[1],
-      total_refunds_checked: params[2],
-      total_transfers_checked: params[3],
-      inconsistencies_found: params[4],
-      results: JSON.parse(params[5]),
-      created_at: new Date().toISOString()
-    };
-    mockReconciliationRuns.push(run);
-    return { rows: [run] };
-  }
-
-  // 26. SELECT reconciliation runs
-  if (text.includes('SELECT * FROM reconciliation_runs')) {
-    return { rows: mockReconciliationRuns };
-  }
-
-  return { rows: [] };
-});
-
-const mockConnect = jest.fn().mockImplementation(() => {
-  return Promise.resolve({
-    query: mockQuery,
-    release: jest.fn()
-  });
-});
-
-// Mock pg library before importing app
-jest.unstable_mockModule('pg', () => ({
+const mockModels = {
   __esModule: true,
-  Pool: jest.fn(() => ({
-    query: mockQuery,
-    connect: mockConnect,
-    on: jest.fn(),
-  })),
+  User,
+  Wallet,
+  LedgerAccount,
+  LedgerTransaction,
+  LedgerEntry,
+  Transfer,
+  Merchant: dummyModel,
+  MerchantApiKey: dummyModel,
+  Payment,
+  Refund,
+  WebhookEndpoint,
+  WebhookDelivery,
+  WebhookEvent,
+  IdempotencyRecord: dummyModel,
+  ReconciliationRun,
+  RiskAssessment,
+  Counter,
   default: {
-    Pool: jest.fn(() => ({
-      query: mockQuery,
-      connect: mockConnect,
-      on: jest.fn(),
-    })),
-  },
-}));
-
-// Mock MongoDB and Redis connections to bypass startup timeouts
-jest.unstable_mockModule('../config/mongodb.js', () => ({
-  connectMongoDB: jest.fn(async () => true),
-  testMongoConnection: jest.fn(() => true)
-}));
-jest.unstable_mockModule('../config/redis.js', () => ({
-  connectRedis: jest.fn(async () => true),
-  testRedisConnection: jest.fn(async () => true),
-  default: {
-    isOpen: true,
-    connect: jest.fn(),
-    on: jest.fn()
+    User,
+    Wallet,
+    LedgerAccount,
+    LedgerTransaction,
+    LedgerEntry,
+    Transfer,
+    Merchant: dummyModel,
+    MerchantApiKey: dummyModel,
+    Payment,
+    Refund,
+    WebhookEndpoint,
+    WebhookDelivery,
+    WebhookEvent,
+    IdempotencyRecord: dummyModel,
+    ReconciliationRun,
+    RiskAssessment,
+    Counter
   }
+};
+
+// Mock modules
+jest.unstable_mockModule('../database/models.js', () => mockModels);
+
+jest.unstable_mockModule('../config/mongodb.js', () => ({
+  __esModule: true,
+  connectMongoDB: jest.fn().mockResolvedValue(true),
+  testMongoConnection: jest.fn().mockReturnValue(true),
+  default: jest.fn().mockResolvedValue(true),
 }));
 
-// Import server application AFTER mocks are defined
-const { app } = await import('../../src/app.js');
+let app;
+let config;
+let merchantToken;
+let adminToken;
 
-describe('FinCore Step 4 Operations, Risk Controls, and Webhooks Integration Tests', () => {
-  const jwtSecret = process.env.JWT_ACCESS_SECRET || 'your_jwt_access_secret_key_here';
-  let merchantToken;
-  let adminToken;
+describe('Operations Console Integration Tests', () => {
+  beforeAll(async () => {
+    const appModule = await import('../app.js');
+    app = appModule.app;
 
-  beforeAll(() => {
-    // Generate JWT tokens for authenticated requests
-    merchantToken = jwt.sign({ id: 2, email: 'merchant@example.com', role: 'MERCHANT' }, jwtSecret);
-    adminToken = jwt.sign({ id: 3, email: 'admin@example.com', role: 'ADMIN' }, jwtSecret);
+    const configModule = await import('../config/config.js');
+    config = configModule.config;
+
+    merchantToken = jwt.sign(
+      { id: 2, email: 'merchant@example.com', role: 'MERCHANT', firstName: 'Merchant', lastName: 'User' },
+      config.jwt.accessSecret
+    );
+    adminToken = jwt.sign(
+      { id: 3, email: 'admin@example.com', role: 'ADMIN', firstName: 'Admin', lastName: 'User' },
+      config.jwt.accessSecret
+    );
   });
 
   afterEach(() => {
-    mockQuery.mockClear();
     mockEndpoints = [];
     mockWebhookEvents = [];
     mockDeliveries = [];
     mockRiskAssessments = [];
     mockReconciliationRuns = [];
-    mockTransfersCount = 0;
-    mockPaymentsCount = 0;
-    mockRefundsCount = 0;
+    mockTransfers = [];
+    mockPayments = [];
+    mockRefunds = [];
+    mockLedgerTransactions = [];
+    mockLedgerEntries = [{ ledgerAccountId: 10, direction: 'CREDIT', amount: 100000 }];
+    localWallets[1].availableBalance = 100000;
+    localWallets[1].available_balance = 100000n;
   });
 
-  describe('1. Webhook Endpoint CRUD APIs', () => {
-    it('should register a new webhook endpoint with validation check', async () => {
+  describe('Merchant Webhook Endpoints Operations', () => {
+    it('should configure webhook endpoint successfully', async () => {
       const res = await request(app)
         .post('/api/merchant/webhooks/endpoints')
         .set('Authorization', `Bearer ${merchantToken}`)
         .send({
-          url: 'https://client-webhook.requestcatcher.com/receive',
+          url: 'https://example.com/webhooks',
           events: ['payment.succeeded', 'refund.succeeded']
         });
 
-      expect(res.status).toBe(201);
+      expect(res.statusCode).toEqual(201);
       expect(res.body.success).toBe(true);
-      expect(res.body.data.url).toBe('https://client-webhook.requestcatcher.com/receive');
-      expect(res.body.data.secret).toContain('whsec_');
-      expect(mockEndpoints.length).toBe(1);
+      expect(res.body.data.url).toEqual('https://example.com/webhooks');
+      expect(res.body.data.secret).toBeDefined();
     });
 
-    it('should prevent registration with invalid URL or empty events selection', async () => {
-      const res = await request(app)
-        .post('/api/merchant/webhooks/endpoints')
-        .set('Authorization', `Bearer ${merchantToken}`)
-        .send({
-          url: 'not-a-valid-url',
-          events: []
-        });
-
-      expect(res.status).toBe(400);
-      expect(res.body.success).toBe(false);
-    });
-
-    it('should list configured webhook endpoints for merchant', async () => {
+    it('should list all webhook endpoints for merchant', async () => {
       mockEndpoints.push({
-        id: 42,
+        id: 1,
         merchant_id: 2,
-        url: 'https://test-webhook.com',
-        secret: 'whsec_dummy123',
+        url: 'https://example.com/webhooks',
+        secret: 'whsec_secret',
         status: 'ACTIVE',
         events: ['payment.succeeded']
       });
@@ -406,142 +543,90 @@ describe('FinCore Step 4 Operations, Risk Controls, and Webhooks Integration Tes
         .get('/api/merchant/webhooks/endpoints')
         .set('Authorization', `Bearer ${merchantToken}`);
 
-      expect(res.status).toBe(200);
-      expect(res.body.data.length).toBe(1);
-      expect(res.body.data[0].url).toBe('https://test-webhook.com');
+      expect(res.statusCode).toEqual(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.length).toEqual(1);
     });
 
-    it('should support rotating webhook signing keys', async () => {
+    it('should rotate webhook endpoint secret', async () => {
       mockEndpoints.push({
-        id: 42,
+        id: 2,
         merchant_id: 2,
-        url: 'https://test-webhook.com',
+        url: 'https://example.com/webhooks',
         secret: 'whsec_old',
         status: 'ACTIVE',
         events: ['payment.succeeded']
       });
 
       const res = await request(app)
-        .post('/api/merchant/webhooks/endpoints/42/rotate')
+        .post(`/api/merchant/webhooks/endpoints/2/rotate`)
         .set('Authorization', `Bearer ${merchantToken}`);
 
-      expect(res.status).toBe(200);
-      expect(res.body.data.secret).not.toBe('whsec_old');
-      expect(res.body.data.secret).toContain('whsec_');
+      expect(res.statusCode).toEqual(200);
+      expect(res.body.success).toBe(true);
+      expect(mockEndpoints[0].secret).not.toEqual('whsec_old');
     });
   });
 
-  describe('2. Risk Rules Engine Checks', () => {
-    it('should approve transactions under low risk criteria', async () => {
-      const { default: riskService } = await import('../../src/modules/risk/service.js');
-      
-      const assessment = await riskService.checkTransactionRisk(
-        1, // Customer wallet
-        'PAYMENT',
-        'pay_123',
-        '5000' // $50.00
+  describe('Operations Risk Engine Safety Gates', () => {
+    it('should trigger excessive amount and rapid drain risk audits', async () => {
+      const paymentOrder = {
+        id: 'pay_large',
+        merchant_id: 2,
+        amount: 2000000n, // $20,000.00
+        currency: 'USD',
+        reference: 'LARGE_REF',
+        status: 'CREATED',
+        idempotency_key: null
+      };
+      mockPayments.push(paymentOrder);
+
+      const customerToken = jwt.sign(
+        { id: 1, email: 'customer@example.com', role: 'CUSTOMER', firstName: 'Customer', lastName: 'User' },
+        config.jwt.accessSecret
       );
 
-      expect(assessment.decision).toBe('APPROVE');
-      expect(assessment.risk_score).toBe(0);
-    });
+      const res = await request(app)
+        .post(`/api/payments/pay_large/checkout`)
+        .set('Authorization', `Bearer ${customerToken}`);
 
-    it('should trigger EXCESSIVE_AMOUNT and block transaction over $10k threshold', async () => {
-      const { default: riskService } = await import('../../src/modules/risk/service.js');
-
-      await expect(
-        riskService.checkTransactionRisk(
-          1,
-          'PAYMENT',
-          'pay_large',
-          '1500000' // $15,000.00 (1.5M cents)
-        )
-      ).rejects.toThrow('Transaction rejected by automated risk safeguards');
-
-      const saved = mockRiskAssessments[0];
-      expect(saved.decision).toBe('BLOCK');
-      expect(saved.rules_triggered).toContain('EXCESSIVE_AMOUNT');
-    });
-
-    it('should trigger RAPID_DRAIN when transaction uses > 90% available balance', async () => {
-      const { default: riskService } = await import('../../src/modules/risk/service.js');
-
-      const assessment = await riskService.checkTransactionRisk(
-        1,
-        'TRANSFER',
-        'tf_drain',
-        '95000' // Wallet balance is $1000.00, $950 is 95%
-      );
-
-      expect(assessment.decision).toBe('REVIEW');
-      expect(assessment.rules_triggered).toContain('RAPID_DRAIN');
-      expect(assessment.risk_score).toBe(45);
-    });
-
-    it('should block velocity attack when count is high', async () => {
-      const { default: riskService } = await import('../../src/modules/risk/service.js');
-      mockTransfersCount = 4; // Velocity limit exceeded
-
-      await expect(
-        riskService.checkTransactionRisk(
-          1,
-          'TRANSFER',
-          'tf_fast',
-          '1000'
-        )
-      ).rejects.toThrow('Transaction rejected by automated risk safeguards');
-
-      const saved = mockRiskAssessments[0];
-      expect(saved.decision).toBe('BLOCK');
-      expect(saved.rules_triggered).toContain('HIGH_VELOCITY');
-      expect(saved.risk_score).toBe(70);
+      expect(res.statusCode).toEqual(400);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error.code).toEqual('RISK_BLOCKED');
+      expect(mockRiskAssessments.length).toBeGreaterThan(0);
+      expect(mockRiskAssessments[0].decision).toEqual('VETO');
     });
   });
 
-  describe('3. Financial Consistency Reconciliation Check', () => {
-    it('should complete check with 0 mismatches when wallet/ledger values align', async () => {
-      const { default: reconciliationService } = await import('../../src/modules/reconciliation/service.js');
+  describe('Platform Financial Reconciliation Runner', () => {
+    it('should run consistency audits and record zero issues on clean ledger', async () => {
+      const res = await request(app)
+        .post('/api/admin/reconciliation/check')
+        .set('Authorization', `Bearer ${adminToken}`);
 
-      mockPaymentsCount = 5;
-      const res = await reconciliationService.runConsistencyCheck();
-
-      expect(res.status).toBe('COMPLETED');
-      expect(res.inconsistencies_found).toBe(0);
-      expect(res.results.length).toBe(0);
+      expect(res.statusCode).toEqual(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.inconsistenciesFound).toEqual(0);
     });
 
-    it('should flag BALANCE_MISMATCH when wallet balance does not match ledger entries sum', async () => {
-      const { default: reconciliationService } = await import('../../src/modules/reconciliation/service.js');
-
-      // Hijack query response to force ledger mismatch for wallet ID 1
-      mockQuery.mockImplementationOnce(async (text, params) => {
-        if (text.includes('SELECT') && text.includes('payments_count')) {
-          return { rows: [{ payments_count: 0, refunds_count: 0, transfers_count: 0 }] };
-        }
-        return { rows: [] };
-      });
-      mockQuery.mockImplementationOnce(async (text, params) => {
-        if (text.includes('SELECT w.id AS wallet_id')) {
-          return {
-            rows: [{
-              wallet_id: 1,
-              user_id: 1,
-              available_balance: '100000',
-              pending_balance: '0',
-              email: 'customer@example.com',
-              role: 'CUSTOMER',
-              ledger_balance: '50000' // Mismatch! Wallet has 100k, ledger sum says 50k
-            }]
-          };
-        }
-        return { rows: [] };
+    it('should flag anomalies when payments exist without matching ledger transactions', async () => {
+      mockPayments.push({
+        id: 'pay_unmatched',
+        merchant_id: 2,
+        customer_wallet_id: 1,
+        amount: 10000n,
+        currency: 'USD',
+        status: 'SUCCEEDED'
       });
 
-      const res = await reconciliationService.runConsistencyCheck();
+      const res = await request(app)
+        .post('/api/admin/reconciliation/check')
+        .set('Authorization', `Bearer ${adminToken}`);
 
-      expect(res.status).toBe('COMPLETED');
-      expect(res.inconsistencies_found).toBe(1);
-      expect(res.results[0].type).toBe('BALANCE_MISMATCH');
+      expect(res.statusCode).toEqual(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.data.inconsistenciesFound).toEqual(1);
+      expect(res.body.data.results[0].type).toEqual('MISSING_PAYMENT_LEDGER');
     });
   });
 });

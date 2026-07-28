@@ -4,150 +4,256 @@ import request from 'supertest';
 
 // Local simulated database state for testing concurrency and invariants
 let localWallets = {
-  1: { id: 1, user_id: 1, available_balance: 100000n, status: 'ACTIVE', currency: 'USD' }, // Sender ($1000)
-  2: { id: 2, user_id: 2, available_balance: 50000n, status: 'ACTIVE', currency: 'USD' },  // Recipient ($500)
-  3: { id: 3, user_id: 3, available_balance: 10000n, status: 'FROZEN', currency: 'USD' },  // Frozen ($100)
+  1: { _id: 1, userId: 1, availableBalance: 100000, status: 'ACTIVE', currency: 'USD', available_balance: 100000n, pending_balance: 0n }, // Sender ($1000)
+  2: { _id: 2, userId: 2, availableBalance: 50000, status: 'ACTIVE', currency: 'USD', available_balance: 50000n, pending_balance: 0n },  // Recipient ($500)
+  3: { _id: 3, userId: 3, availableBalance: 10000, status: 'FROZEN', currency: 'USD', available_balance: 10000n, pending_balance: 0n },  // Frozen ($100)
 };
 
 let localUsers = {
-  1: { id: 1, email: 'sender@example.com', role: 'CUSTOMER', first_name: 'Sender', last_name: 'User' },
-  2: { id: 2, email: 'recipient@example.com', role: 'CUSTOMER', first_name: 'Recipient', last_name: 'User' },
-  3: { id: 3, email: 'frozen@example.com', role: 'CUSTOMER', first_name: 'Frozen', last_name: 'User' },
+  1: { _id: 1, email: 'sender@example.com', role: 'CUSTOMER', firstName: 'Sender', lastName: 'User' },
+  2: { _id: 2, email: 'recipient@example.com', role: 'CUSTOMER', firstName: 'Recipient', lastName: 'User' },
+  3: { _id: 3, email: 'frozen@example.com', role: 'CUSTOMER', firstName: 'Frozen', lastName: 'User' },
 };
 
 let mockTransfers = [];
 let mockLedgerTransactions = [];
 let mockLedgerEntries = [];
-let lockedWallets = new Set();
+let localRedisCache = {};
 
-const mockQuery = jest.fn(async (text, params) => {
-  // 1. SELECT users BY email
-  if (text.includes('SELECT * FROM users WHERE email = $1')) {
-    const email = params[0];
+const makeQueryChain = (result) => {
+  const chain = {
+    lean: jest.fn(() => chain),
+    session: jest.fn(() => chain),
+    sort: jest.fn(() => chain),
+    then: (resolve, reject) => Promise.resolve(result).then(resolve, reject),
+    catch: (reject) => Promise.resolve(result).catch(reject)
+  };
+  return chain;
+};
+
+const dummyModel = {
+  create: jest.fn(async (data) => {
+    if (Array.isArray(data)) {
+      return data.map(d => ({ toObject: () => d, ...d }));
+    }
+    return { toObject: () => data, ...data };
+  }),
+  find: jest.fn(() => makeQueryChain([])),
+  findOne: jest.fn(() => makeQueryChain(null)),
+  findById: jest.fn(() => makeQueryChain(null)),
+  findByIdAndUpdate: jest.fn(async () => null),
+  findByIdAndDelete: jest.fn(async () => null),
+  findOneAndUpdate: jest.fn(async () => null),
+  countDocuments: jest.fn(async () => 0)
+};
+
+const User = {
+  findOne: jest.fn((q) => {
+    const email = q.email;
     const user = Object.values(localUsers).find((u) => u.email === email);
-    return { rows: user ? [user] : [] };
-  }
-
-  // 2. SELECT users BY id
-  if (text.includes('SELECT id, first_name, last_name, email, role, created_at FROM users WHERE id = $1')) {
-    const id = params[0];
+    return makeQueryChain(user ? { toObject: () => user, ...user } : null);
+  }),
+  findById: jest.fn((id) => {
     const user = localUsers[id];
-    return { rows: user ? [user] : [] };
-  }
+    return makeQueryChain(user ? { toObject: () => user, ...user } : null);
+  }),
+};
 
-  // 3. SELECT wallets BY user_id
-  if (text.includes('SELECT * FROM wallets WHERE user_id = $1')) {
-    const userId = params[0];
-    const wallet = Object.values(localWallets).find((w) => w.user_id === userId);
-    return { rows: wallet ? [wallet] : [] };
-  }
-
-  // 4. SELECT wallets FOR UPDATE (Simulating PostgreSQL Row Locking)
-  if (text.includes('SELECT * FROM wallets WHERE id = $1 FOR UPDATE')) {
-    const id = params[0];
-    // If already locked by another concurrent process, wait
-    while (lockedWallets.has(id)) {
-      await new Promise((resolve) => setTimeout(resolve, 5));
+const Wallet = {
+  findOne: jest.fn((q) => {
+    const userId = q.userId;
+    const wallet = Object.values(localWallets).find((w) => w.userId === userId);
+    return makeQueryChain(wallet ? { toObject: () => wallet, ...wallet } : null);
+  }),
+  findById: jest.fn((id) => {
+    const wallet = localWallets[id];
+    return makeQueryChain(wallet ? { toObject: () => wallet, ...wallet } : null);
+  }),
+  findOneAndUpdate: jest.fn(async (query, update) => {
+    const id = query._id;
+    const minBalance = query.availableBalance ? query.availableBalance.$gte : 0;
+    const wallet = localWallets[id];
+    if (wallet && wallet.status === 'ACTIVE' && wallet.availableBalance >= minBalance) {
+      if (update.$inc) {
+        wallet.availableBalance += (update.$inc.availableBalance || 0);
+        wallet.available_balance = BigInt(wallet.availableBalance);
+      }
+      return { toObject: () => wallet, ...wallet };
     }
-    lockedWallets.add(id);
-    return { rows: [localWallets[id]] };
-  }
-
-  // 5. UPDATE wallets balance
-  if (text.includes('UPDATE wallets')) {
-    const id = params[0];
-    const change = BigInt(params[1]);
-    localWallets[id].available_balance += change;
-    return { rows: [localWallets[id]] };
-  }
-
-  // 6. SELECT ledger_accounts
-  if (text.includes('SELECT * FROM ledger_accounts')) {
-    const holderId = params[1];
-    return { rows: [{ id: holderId, holder_type: 'CUSTOMER', holder_id: holderId }] };
-  }
-
-  // 7. INSERT transfers
-  if (text.includes('INSERT INTO transfers')) {
-    const transfer = {
-      id: params[0],
-      sender_wallet_id: params[1],
-      recipient_wallet_id: params[2],
-      amount: params[3],
-      currency: params[4],
-      status: params[5],
-      idempotency_key: params[6],
-      description: params[7],
-      created_at: new Date().toISOString(),
-    };
-    mockTransfers.push(transfer);
-    return { rows: [transfer] };
-  }
-
-  // 8. UPDATE transfers status
-  if (text.includes('UPDATE transfers') && text.includes('status = $2')) {
-    const id = params[0];
-    const status = params[1];
-    const transfer = mockTransfers.find((t) => t.id === id);
-    if (transfer) {
-      transfer.status = status;
+    return null;
+  }),
+  findByIdAndUpdate: jest.fn(async (id, update) => {
+    const wallet = localWallets[id];
+    if (wallet) {
+      if (update.$inc) {
+        wallet.availableBalance += (update.$inc.availableBalance || 0);
+        wallet.available_balance = BigInt(wallet.availableBalance);
+      }
+      return { toObject: () => wallet, ...wallet };
     }
-    return { rows: [transfer] };
-  }
+    return null;
+  })
+};
 
-  // 9. INSERT ledger_transactions
-  if (text.includes('INSERT INTO ledger_transactions')) {
-    const tx = { id: params[0], reference_type: params[1], reference_id: params[2] };
+const LedgerAccount = {
+  findOne: jest.fn((q) => {
+    const holderId = q.holderId;
+    return makeQueryChain({ _id: holderId, holderType: 'CUSTOMER', holderId });
+  })
+};
+
+const LedgerTransaction = {
+  create: jest.fn(async (data) => {
+    const tx = data[0];
     mockLedgerTransactions.push(tx);
-    return { rows: [tx] };
-  }
+    return [{ toObject: () => tx, ...tx }];
+  }),
+  findOne: jest.fn((q) => {
+    const tx = mockLedgerTransactions.find(t => t.referenceId === q.referenceId);
+    return makeQueryChain(tx ? { toObject: () => tx, ...tx } : null);
+  })
+};
 
-  // 10. INSERT ledger_entries
-  if (text.includes('INSERT INTO ledger_entries')) {
-    const entry = {
-      ledger_transaction_id: params[0],
-      ledger_account_id: params[1],
-      direction: params[2],
-      amount: params[3],
-      currency: params[4],
+const LedgerEntry = {
+  create: jest.fn(async (data) => {
+    for (const entry of data) {
+      mockLedgerEntries.push({
+        ledger_transaction_id: entry.ledgerTransactionId,
+        ledger_account_id: entry.ledgerAccountId,
+        direction: entry.direction,
+        amount: BigInt(entry.amount),
+        currency: entry.currency
+      });
+    }
+    return data;
+  })
+};
+
+const Transfer = {
+  create: jest.fn(async (data) => {
+    const t = data[0];
+    const transfer = {
+      _id: t._id,
+      senderWalletId: t.senderWalletId,
+      recipientWalletId: t.recipientWalletId,
+      amount: t.amount,
+      currency: t.currency,
+      status: t.status,
+      idempotencyKey: t.idempotencyKey,
+      description: t.description,
+      createdAt: new Date(),
+      updatedAt: new Date()
     };
-    mockLedgerEntries.push(entry);
-    return { rows: [entry] };
-  }
+    mockTransfers.push({
+      id: transfer._id,
+      sender_wallet_id: transfer.senderWalletId,
+      recipient_wallet_id: transfer.recipientWalletId,
+      amount: BigInt(transfer.amount),
+      currency: transfer.currency,
+      status: transfer.status,
+      idempotency_key: transfer.idempotencyKey,
+      description: transfer.description,
+      created_at: transfer.createdAt
+    });
+    return [{ toObject: () => transfer, ...transfer }];
+  }),
+  findByIdAndUpdate: jest.fn(async (id, update) => {
+    const transfer = mockTransfers.find((t) => t.id === id);
+    if (transfer && update.$set) {
+      transfer.status = update.$set.status;
+    }
+    return transfer ? { toObject: () => transfer, ...transfer } : null;
+  }),
+  findOne: jest.fn((q) => {
+    const transfer = mockTransfers.find((t) => t.idempotency_key === q.idempotencyKey);
+    return makeQueryChain(transfer ? { toObject: () => transfer, ...transfer } : null);
+  }),
+  countDocuments: jest.fn(async () => mockTransfers.length)
+};
 
-  // Transaction control helper hooks
-  if (text.includes('COMMIT') || text.includes('ROLLBACK')) {
-    lockedWallets.clear();
-    return { rows: [] };
-  }
+const IdempotencyRecord = {
+  findOne: jest.fn((q) => {
+    const key = q.idempotencyKey;
+    const record = localRedisCache[key];
+    return makeQueryChain(record ? {
+      idempotencyKey: key,
+      requestHash: record.fingerprint,
+      responseStatus: record.statusCode,
+      responseBody: record.responseBody,
+      status: record.status
+    } : null);
+  }),
+  create: jest.fn(async (data) => {
+    const key = data.idempotencyKey;
+    localRedisCache[key] = {
+      status: data.status,
+      fingerprint: data.requestHash
+    };
+    return data;
+  }),
+  findOneAndUpdate: jest.fn(async (query, update) => {
+    const key = query.idempotencyKey;
+    const record = localRedisCache[key];
+    if (record && update.$set) {
+      record.status = update.$set.status;
+      record.statusCode = update.$set.responseStatus;
+      record.responseBody = update.$set.responseBody;
+    }
+    return record;
+  }),
+  deleteOne: jest.fn(async (query) => {
+    delete localRedisCache[query.idempotencyKey];
+    return { deletedCount: 1 };
+  })
+};
 
-  return { rows: [] };
-});
+const Counter = {
+  getNextSequence: jest.fn(async () => 1)
+};
 
-// Mock pg library before importing app
-jest.unstable_mockModule('pg', () => ({
+const mockModels = {
   __esModule: true,
-  Pool: jest.fn(() => ({
-    query: mockQuery,
-    connect: jest.fn().mockResolvedValue({
-      query: mockQuery,
-      release: jest.fn(),
-    }),
-    on: jest.fn(),
-  })),
+  User,
+  Wallet,
+  LedgerAccount,
+  LedgerTransaction,
+  LedgerEntry,
+  Transfer,
+  Merchant: dummyModel,
+  MerchantApiKey: dummyModel,
+  Payment: dummyModel,
+  Refund: dummyModel,
+  WebhookEndpoint: dummyModel,
+  WebhookDelivery: dummyModel,
+  WebhookEvent: dummyModel,
+  IdempotencyRecord,
+  ReconciliationRun: dummyModel,
+  RiskAssessment: dummyModel,
+  Counter,
   default: {
-    Pool: jest.fn(() => ({
-      query: mockQuery,
-      connect: jest.fn().mockResolvedValue({
-        query: mockQuery,
-        release: jest.fn(),
-      }),
-      on: jest.fn(),
-    })),
-  },
-}));
+    User,
+    Wallet,
+    LedgerAccount,
+    LedgerTransaction,
+    LedgerEntry,
+    Transfer,
+    Merchant: dummyModel,
+    MerchantApiKey: dummyModel,
+    Payment: dummyModel,
+    Refund: dummyModel,
+    WebhookEndpoint: dummyModel,
+    WebhookDelivery: dummyModel,
+    WebhookEvent: dummyModel,
+    IdempotencyRecord,
+    ReconciliationRun: dummyModel,
+    RiskAssessment: dummyModel,
+    Counter
+  }
+};
 
-// Mock mongo and redis config connections
+// Mock modules to bypass DB
+jest.unstable_mockModule('../database/models.js', () => mockModels);
+
 jest.unstable_mockModule('../config/mongodb.js', () => ({
   __esModule: true,
   connectMongoDB: jest.fn().mockResolvedValue(true),
@@ -155,39 +261,11 @@ jest.unstable_mockModule('../config/mongodb.js', () => ({
   default: jest.fn().mockResolvedValue(true),
 }));
 
-// Mock Redis client cache for Idempotency
-let localRedisCache = {};
-const mockRedisClient = {
-  isOpen: true,
-  connect: jest.fn().mockResolvedValue(true),
-  ping: jest.fn().mockResolvedValue('PONG'),
-  on: jest.fn(),
-  get: jest.fn(async (key) => localRedisCache[key] || null),
-  set: jest.fn(async (key, value) => {
-    localRedisCache[key] = value;
-    return 'OK';
-  }),
-  del: jest.fn(async (key) => {
-    delete localRedisCache[key];
-    return 1;
-  }),
-};
-
-jest.unstable_mockModule('../config/redis.js', () => ({
-  __esModule: true,
-  redisClient: mockRedisClient,
-  connectRedis: jest.fn().mockResolvedValue(true),
-  testRedisConnection: jest.fn().mockResolvedValue(true),
-  default: mockRedisClient,
-}));
-
-// Dynamic import placeholders
 let app;
 let config;
+let senderToken;
 
-describe('Transfer & Financial Core Integration Tests', () => {
-  let senderToken;
-
+describe('Transfer Integration Tests', () => {
   beforeAll(async () => {
     const appModule = await import('../app.js');
     app = appModule.app;
@@ -196,7 +274,7 @@ describe('Transfer & Financial Core Integration Tests', () => {
     config = configModule.config;
 
     senderToken = jwt.sign(
-      { id: 1, email: 'sender@example.com', role: 'CUSTOMER' },
+      { id: 1, email: 'sender@example.com', role: 'CUSTOMER', firstName: 'Sender', lastName: 'User' },
       config.jwt.accessSecret
     );
   });
@@ -206,10 +284,12 @@ describe('Transfer & Financial Core Integration Tests', () => {
     mockLedgerTransactions = [];
     mockLedgerEntries = [];
     localRedisCache = {};
-    lockedWallets.clear();
     // Reset balances
+    localWallets[1].availableBalance = 100000;
     localWallets[1].available_balance = 100000n;
+    localWallets[2].availableBalance = 50000;
     localWallets[2].available_balance = 50000n;
+    localWallets[3].availableBalance = 10000;
     localWallets[3].available_balance = 10000n;
   });
 
@@ -220,7 +300,7 @@ describe('Transfer & Financial Core Integration Tests', () => {
         .set('Authorization', `Bearer ${senderToken}`)
         .send({
           recipientEmail: 'recipient@example.com',
-          amount: 20000, // $200
+          amount: 20000,
           description: 'Rent sharing payment',
         });
 
@@ -229,13 +309,11 @@ describe('Transfer & Financial Core Integration Tests', () => {
       expect(res.body.data.status).toEqual('COMPLETED');
       expect(res.body.data.amount).toEqual('20000');
 
-      // Verify wallet balances updated
-      expect(localWallets[1].available_balance).toEqual(80000n); // $1000 - $200 = $800
-      expect(localWallets[2].available_balance).toEqual(70000n); // $500 + $200 = $700
+      expect(localWallets[1].available_balance).toEqual(80000n);
+      expect(localWallets[2].available_balance).toEqual(70000n);
 
-      // Verify double-entry ledger postings are balanced
       const entries = mockLedgerEntries.filter(
-        (e) => e.ledger_transaction_id === mockLedgerTransactions[0].id
+        (e) => e.ledger_transaction_id === mockLedgerTransactions[0]._id
       );
       expect(entries).toHaveLength(2);
       expect(entries.find((e) => e.direction === 'DEBIT').amount).toEqual(20000n);
@@ -248,7 +326,7 @@ describe('Transfer & Financial Core Integration Tests', () => {
         .set('Authorization', `Bearer ${senderToken}`)
         .send({
           recipientEmail: 'recipient@example.com',
-          amount: 150000, // $1500 (sender only has $1000)
+          amount: 150000,
         });
 
       expect(res.statusCode).toEqual(400);
@@ -275,21 +353,19 @@ describe('Transfer & Financial Core Integration Tests', () => {
     it('should execute transfer exactly once and return cached response on duplicates', async () => {
       const idempotencyKey = 'unique-key-12345';
 
-      // 1. Submit first request
       const res1 = await request(app)
         .post('/api/transfers')
         .set('Authorization', `Bearer ${senderToken}`)
         .set('Idempotency-Key', idempotencyKey)
         .send({
           recipientEmail: 'recipient@example.com',
-          amount: 10000, // $100
+          amount: 10000,
         });
 
       expect(res1.statusCode).toEqual(201);
       expect(res1.body.success).toBe(true);
-      expect(localWallets[1].available_balance).toEqual(90000n); // Deducted once
+      expect(localWallets[1].available_balance).toEqual(90000n);
 
-      // 2. Submit second duplicate request with same key
       const res2 = await request(app)
         .post('/api/transfers')
         .set('Authorization', `Bearer ${senderToken}`)
@@ -303,7 +379,6 @@ describe('Transfer & Financial Core Integration Tests', () => {
       expect(res2.headers['x-cache-lookup']).toEqual('HIT - Idempotent');
       expect(res2.body.data.id).toEqual(res1.body.data.id);
       
-      // Balance MUST remain $900 (not double deducted!)
       expect(localWallets[1].available_balance).toEqual(90000n);
     });
 
@@ -319,7 +394,6 @@ describe('Transfer & Financial Core Integration Tests', () => {
           amount: 10000,
         });
 
-      // Submit request with same key but different amount
       const res = await request(app)
         .post('/api/transfers')
         .set('Authorization', `Bearer ${senderToken}`)
@@ -337,10 +411,9 @@ describe('Transfer & Financial Core Integration Tests', () => {
 
   describe('Safe Concurrency & Double-Spending Prevention', () => {
     it('should serialize concurrent transactions and prevent overspending', async () => {
-      // Set balance to exactly $100 (10000 cents)
+      localWallets[1].availableBalance = 10000;
       localWallets[1].available_balance = 10000n;
 
-      // Send two concurrent transfer requests ($80 and $70) in parallel
       const req1 = request(app)
         .post('/api/transfers')
         .set('Authorization', `Bearer ${senderToken}`)
@@ -359,7 +432,6 @@ describe('Transfer & Financial Core Integration Tests', () => {
 
       const [res1, res2] = await Promise.all([req1, req2]);
 
-      // Verify that exactly one succeeds and one fails with INSUFFICIENT_FUNDS
       const statuses = [res1.statusCode, res2.statusCode];
       expect(statuses).toContain(201);
       expect(statuses).toContain(400);
@@ -369,9 +441,8 @@ describe('Transfer & Financial Core Integration Tests', () => {
 
       expect(failedRes.body.error.code).toEqual('INSUFFICIENT_FUNDS');
       
-      // Balance must decrease by the successful amount only (either $80 or $70)
-      const expectedBalance = 10000n - BigInt(successfulRes.body.data.amount);
-      expect(localWallets[1].available_balance).toEqual(expectedBalance);
+      const expectedBalance = 10000 - Number(successfulRes.body.data.amount);
+      expect(localWallets[1].availableBalance).toEqual(expectedBalance);
     });
   });
 });

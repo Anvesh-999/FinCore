@@ -1,126 +1,186 @@
-import pool from '../../config/db.js';
+import { WebhookEndpoint, WebhookEvent, WebhookDelivery, Counter, User } from '../../database/models.js';
 
 export class WebhookRepository {
+  formatEndpoint(e) {
+    if (!e) return null;
+    return {
+      id: e._id,
+      merchant_id: e.merchantId,
+      url: e.url,
+      secret: e.secret,
+      status: e.status,
+      events: e.events || [],
+      created_at: e.createdAt,
+      updated_at: e.updatedAt
+    };
+  }
+
+  formatEvent(ev) {
+    if (!ev) return null;
+    return {
+      id: ev._id,
+      merchant_id: ev.merchantId,
+      event_type: ev.eventType,
+      payload: ev.payload || {},
+      status: ev.status,
+      created_at: ev.createdAt
+    };
+  }
+
+  formatDelivery(d) {
+    if (!d) return null;
+    return {
+      id: d._id,
+      merchant_id: d.merchantId,
+      webhook_event_id: d.eventId,
+      webhook_endpoint_id: d.endpointId,
+      response_status: d.responseStatus,
+      response_body: d.responseBody,
+      attempt_number: d.attemptNumber,
+      status: d.status,
+      created_at: d.createdAt
+    };
+  }
+
   // --- Endpoint Management ---
-  async createEndpoint({ merchantId, url, secret, events }) {
-    const query = `
-      INSERT INTO webhook_endpoints (merchant_id, url, secret, events)
-      VALUES ($1, $2, $3, $4::jsonb)
-      RETURNING *
-    `;
-    const { rows } = await pool.query(query, [merchantId, url, secret, JSON.stringify(events)]);
-    return rows[0];
+  async createEndpoint({ merchantId, url, secret, events }, session) {
+    const nextId = await Counter.getNextSequence('webhook_endpoints');
+    const endpoint = await WebhookEndpoint.create(
+      [{
+        _id: nextId,
+        merchantId: Number(merchantId),
+        url,
+        secret,
+        events
+      }],
+      { session }
+    );
+    return this.formatEndpoint(endpoint[0].toObject());
   }
 
   async findEndpointById(id) {
-    const query = `SELECT * FROM webhook_endpoints WHERE id = $1`;
-    const { rows } = await pool.query(query, [id]);
-    return rows[0];
+    const endpoint = await WebhookEndpoint.findById(id).lean();
+    return this.formatEndpoint(endpoint);
   }
 
   async findEndpointsByMerchant(merchantId) {
-    const query = `SELECT * FROM webhook_endpoints WHERE merchant_id = $1 ORDER BY created_at DESC`;
-    const { rows } = await pool.query(query, [merchantId]);
-    return rows;
+    const list = await WebhookEndpoint.find({ merchantId: Number(merchantId) }).sort({ createdAt: -1 }).lean();
+    return list.map(e => this.formatEndpoint(e));
   }
 
   async findActiveEndpointsByMerchantAndEvent(merchantId, eventType) {
-    const query = `
-      SELECT * FROM webhook_endpoints 
-      WHERE merchant_id = $1 
-        AND status = 'ACTIVE' 
-        AND events @> $2::jsonb
-    `;
-    const { rows } = await pool.query(query, [merchantId, JSON.stringify([eventType])]);
-    return rows;
+    const list = await WebhookEndpoint.find({
+      merchantId: Number(merchantId),
+      status: 'ACTIVE',
+      events: eventType
+    }).lean();
+    return list.map(e => this.formatEndpoint(e));
   }
 
   async updateEndpoint(id, { url, status, events }) {
-    const query = `
-      UPDATE webhook_endpoints
-      SET url = $1, status = $2, events = $3::jsonb, updated_at = NOW()
-      WHERE id = $4
-      RETURNING *
-    `;
-    const { rows } = await pool.query(query, [url, status, JSON.stringify(events), id]);
-    return rows[0];
+    const endpoint = await WebhookEndpoint.findByIdAndUpdate(
+      id,
+      { $set: { url, status, events, updatedAt: new Date() } },
+      { new: true }
+    );
+    return this.formatEndpoint(endpoint ? endpoint.toObject() : null);
   }
 
   async deleteEndpoint(id) {
-    const query = `DELETE FROM webhook_endpoints WHERE id = $1 RETURNING *`;
-    const { rows } = await pool.query(query, [id]);
-    return rows[0];
+    const endpoint = await WebhookEndpoint.findByIdAndDelete(id);
+    return this.formatEndpoint(endpoint ? endpoint.toObject() : null);
   }
 
   async updateSecret(id, newSecret) {
-    const query = `
-      UPDATE webhook_endpoints
-      SET secret = $1, updated_at = NOW()
-      WHERE id = $2
-      RETURNING *
-    `;
-    const { rows } = await pool.query(query, [newSecret, id]);
-    return rows[0];
+    const endpoint = await WebhookEndpoint.findByIdAndUpdate(
+      id,
+      { $set: { secret: newSecret, updatedAt: new Date() } },
+      { new: true }
+    );
+    return this.formatEndpoint(endpoint ? endpoint.toObject() : null);
   }
 
   // --- Webhook Events ---
   async createWebhookEvent({ id, merchantId, eventType, payload, status = 'PENDING' }) {
-    const query = `
-      INSERT INTO webhook_events (id, merchant_id, event_type, payload, status)
-      VALUES ($1, $2, $3, $4::jsonb, $5)
-      RETURNING *
-    `;
-    const { rows } = await pool.query(query, [id, merchantId, eventType, JSON.stringify(payload), status]);
-    return rows[0];
+    const event = await WebhookEvent.create({
+      _id: id,
+      merchantId: Number(merchantId),
+      eventType,
+      payload,
+      status
+    });
+    return this.formatEvent(event.toObject());
   }
 
   async findWebhookEventById(id) {
-    const query = `SELECT * FROM webhook_events WHERE id = $1`;
-    const { rows } = await pool.query(query, [id]);
-    return rows[0];
+    const event = await WebhookEvent.findById(id).lean();
+    return this.formatEvent(event);
   }
 
   async updateWebhookEventStatus(id, status) {
-    const query = `UPDATE webhook_events SET status = $1 WHERE id = $2 RETURNING *`;
-    const { rows } = await pool.query(query, [status, id]);
-    return rows[0];
+    const event = await WebhookEvent.findByIdAndUpdate(
+      id,
+      { $set: { status } },
+      { new: true }
+    );
+    return this.formatEvent(event ? event.toObject() : null);
   }
 
   // --- Webhook Deliveries (Attempt Logs) ---
   async createWebhookDelivery({ id, eventId, endpointId, responseStatus, responseBody, attemptNumber, status }) {
-    const query = `
-      INSERT INTO webhook_deliveries (id, webhook_event_id, webhook_endpoint_id, response_status, response_body, attempt_number, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-      RETURNING *
-    `;
-    const { rows } = await pool.query(query, [id, eventId, endpointId, responseStatus, responseBody, attemptNumber, status]);
-    return rows[0];
+    const event = await WebhookEvent.findById(eventId).lean();
+    
+    const delivery = await WebhookDelivery.create({
+      _id: id,
+      merchantId: event ? event.merchantId : 0,
+      eventId,
+      endpointId: Number(endpointId),
+      responseStatus,
+      responseBody,
+      attemptNumber,
+      status
+    });
+    return this.formatDelivery(delivery.toObject());
   }
 
   async getDeliveriesByMerchant(merchantId) {
-    const query = `
-      SELECT d.*, e.event_type, e.payload, p.url
-      FROM webhook_deliveries d
-      JOIN webhook_events e ON d.webhook_event_id = e.id
-      JOIN webhook_endpoints p ON d.webhook_endpoint_id = p.id
-      WHERE e.merchant_id = $1
-      ORDER BY d.created_at DESC
-    `;
-    const { rows } = await pool.query(query, [merchantId]);
-    return rows;
+    const deliveries = await WebhookDelivery.find({ merchantId: Number(merchantId) }).sort({ createdAt: -1 }).lean();
+    const result = [];
+    for (const d of deliveries) {
+      const event = await WebhookEvent.findById(d.eventId).lean();
+      const endpoint = await WebhookEndpoint.findById(d.endpointId).lean();
+      result.push({
+        ...this.formatDelivery(d),
+        event_type: event ? event.eventType : 'unknown',
+        payload: event ? event.payload : {},
+        url: endpoint ? endpoint.url : 'unknown'
+      });
+    }
+    return result;
   }
 
   async getAllDeliveries() {
-    const query = `
-      SELECT d.*, e.event_type, e.payload, p.url, u.email as merchant_email
-      FROM webhook_deliveries d
-      JOIN webhook_events e ON d.webhook_event_id = e.id
-      JOIN webhook_endpoints p ON d.webhook_endpoint_id = p.id
-      JOIN users u ON e.merchant_id = u.id
-      ORDER BY d.created_at DESC
-    `;
-    const { rows } = await pool.query(query);
-    return rows;
+    const deliveries = await WebhookDelivery.find().sort({ createdAt: -1 }).lean();
+    const result = [];
+    for (const d of deliveries) {
+      const event = await WebhookEvent.findById(d.eventId).lean();
+      const endpoint = await WebhookEndpoint.findById(d.endpointId).lean();
+      let merchantEmail = 'unknown';
+      if (event) {
+        const user = await User.findById(event.merchantId).lean();
+        if (user) {
+          merchantEmail = user.email;
+        }
+      }
+      result.push({
+        ...this.formatDelivery(d),
+        event_type: event ? event.eventType : 'unknown',
+        payload: event ? event.payload : {},
+        url: endpoint ? endpoint.url : 'unknown',
+        merchant_email: merchantEmail
+      });
+    }
+    return result;
   }
 }
 

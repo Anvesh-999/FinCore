@@ -1,11 +1,11 @@
 import crypto from 'crypto';
+import { Wallet } from '../../database/models.js';
 import paymentRepository from './repository.js';
 import walletRepository from '../wallets/repository.js';
 import ledgerService from '../ledger/service.js';
 import riskService from '../risk/service.js';
 import webhookService from '../webhooks/service.js';
 import { emitToRoom } from '../../config/socket.js';
-import pool from '../../config/db.js';
 import { AppError } from '../../middleware/error.js';
 import logger from '../../middleware/logger.js';
 
@@ -48,62 +48,63 @@ export class PaymentService {
   }
 
   async processCheckout(paymentId, customerUserId) {
-    const client = await pool.connect();
+    // 1. Fetch payment
+    const payment = await paymentRepository.findById(paymentId);
+    if (!payment) {
+      throw new AppError('PAYMENT_NOT_FOUND', 'Payment order not found', 404);
+    }
+
+    if (payment.status === 'SUCCEEDED') {
+      return this.formatPayment(payment);
+    }
+
+    if (!['CREATED', 'PENDING', 'PROCESSING'].includes(payment.status)) {
+      throw new AppError('INVALID_PAYMENT_STATE', `Payment cannot be processed from state: ${payment.status}`, 400);
+    }
+
+    // 2. Fetch customer wallet
+    const customerWallet = await walletRepository.findByUserId(customerUserId);
+    if (!customerWallet) {
+      throw new AppError('WALLET_NOT_FOUND', 'Customer sandbox wallet not found', 404);
+    }
+
+    if (customerWallet.status === 'FROZEN') {
+      throw new AppError('WALLET_FROZEN', 'Your wallet is currently FROZEN', 400);
+    }
+
+    const paymentAmount = Number(payment.amount);
+
+    // 3. Concurrency-safe atomic debit of customer wallet
+    const customerWalletUpdate = await Wallet.findOneAndUpdate(
+      { _id: customerWallet.id, availableBalance: { $gte: paymentAmount }, status: 'ACTIVE' },
+      { $inc: { availableBalance: -paymentAmount }, $set: { updatedAt: new Date() } },
+      { new: true }
+    );
+
+    if (!customerWalletUpdate) {
+      throw new AppError('INSUFFICIENT_FUNDS', 'Your wallet does not have sufficient available funds', 400);
+    }
+
+    let updatedPayment = null;
     try {
-      await client.query('BEGIN');
-
-      // 1. Lock payment record
-      const payment = await paymentRepository.lockPayment(paymentId, client);
-      if (!payment) {
-        throw new AppError('PAYMENT_NOT_FOUND', 'Payment order not found', 404);
-      }
-
-      if (payment.status === 'SUCCEEDED') {
-        await client.query('COMMIT');
-        return this.formatPayment(payment);
-      }
-
-      if (!['CREATED', 'PENDING', 'PROCESSING'].includes(payment.status)) {
-        throw new AppError('INVALID_PAYMENT_STATE', `Payment cannot be processed from state: ${payment.status}`, 400);
-      }
-
-      // 2. Fetch customer wallet & lock
-      const customerWallet = await walletRepository.findByUserId(customerUserId);
-      if (!customerWallet) {
-        throw new AppError('WALLET_NOT_FOUND', 'Customer sandbox wallet not found', 404);
-      }
-      await walletRepository.lockWallet(customerWallet.id, client);
-
-      if (customerWallet.status === 'FROZEN') {
-        throw new AppError('WALLET_FROZEN', 'Your wallet is currently FROZEN', 400);
-      }
-
-      // 3. Check sufficient funds
-      const paymentAmount = BigInt(payment.amount);
-      if (BigInt(customerWallet.available_balance) < paymentAmount) {
-        throw new AppError('INSUFFICIENT_FUNDS', 'Your wallet does not have sufficient available funds', 400);
-      }
-
       // Run risk assessment check
       await riskService.checkTransactionRisk(customerWallet.id, 'PAYMENT', payment.id, paymentAmount.toString());
 
-      // 4. Fetch merchant wallet & lock
-      const merchantWallet = await walletRepository.findByUserId(payment.merchant_id);
+      // 4. Fetch merchant wallet
+      const merchantWallet = await walletRepository.findByUserId(payment.merchantId);
       if (!merchantWallet) {
         throw new AppError('WALLET_NOT_FOUND', 'Merchant wallet not found', 404);
       }
-      await walletRepository.lockWallet(merchantWallet.id, client);
 
       // 5. Fetch ledger accounts for double-entry
-      const customerLedgerAccount = await ledgerService.findLedgerAccount('CUSTOMER', customerUserId, client);
-      const merchantLedgerAccount = await ledgerService.findLedgerAccount('MERCHANT', payment.merchant_id, client);
+      const customerLedgerAccount = await ledgerService.findLedgerAccount('CUSTOMER', customerUserId);
+      const merchantLedgerAccount = await ledgerService.findLedgerAccount('MERCHANT', payment.merchantId);
       if (!customerLedgerAccount || !merchantLedgerAccount) {
         throw new AppError('LEDGER_ACCOUNT_NOT_FOUND', 'Ledger accounts are not initialized for customer or merchant', 400);
       }
 
-      // 6. Update balances
-      await walletRepository.updateBalances(customerWallet.id, -paymentAmount, 0n, client);
-      await walletRepository.updateBalances(merchantWallet.id, paymentAmount, 0n, client);
+      // 6. Update merchant wallet balance
+      await walletRepository.updateBalances(merchantWallet.id, paymentAmount, 0);
 
       // 7. Post ledger transaction
       await ledgerService.postTransaction({
@@ -123,31 +124,33 @@ export class PaymentService {
             currency: payment.currency,
           }
         ]
-      }, client);
+      });
 
       // 8. Update payment status to SUCCEEDED
-      const updatedPayment = await paymentRepository.updatePaymentStatus(payment.id, 'SUCCEEDED', customerWallet.id, client);
+      updatedPayment = await paymentRepository.updatePaymentStatus(payment.id, 'SUCCEEDED', customerWallet.id);
 
-      await client.query('COMMIT');
       logger.info(`Payment checkout succeeded for ${payment.id}. Customer wallet ${customerWallet.id} debited, Merchant wallet ${merchantWallet.id} credited.`);
 
       // Trigger webhook event
-      webhookService.triggerWebhook(payment.merchant_id, 'payment.succeeded', this.formatPayment(updatedPayment)).catch((err) => {
+      webhookService.triggerWebhook(payment.merchantId, 'payment.succeeded', this.formatPayment(updatedPayment)).catch((err) => {
         logger.error(`Failed to trigger webhook for payment ${payment.id}:`, err);
       });
 
       // Emit to Socket rooms
       const formatted = this.formatPayment(updatedPayment);
-      emitToRoom(`merchant_${payment.merchant_id}`, 'payment.updated', formatted);
+      emitToRoom(`merchant_${payment.merchantId}`, 'payment.updated', formatted);
       emitToRoom(`customer_${customerUserId}`, 'payment.updated', formatted);
       emitToRoom('admin', 'payment.updated', formatted);
 
       return formatted;
     } catch (err) {
-      await client.query('ROLLBACK');
+      // Reversal compensating update: credit back the customer wallet
+      await Wallet.findByIdAndUpdate(customerWallet.id, {
+        $inc: { availableBalance: paymentAmount },
+        $set: { updatedAt: new Date() }
+      });
+      await paymentRepository.updatePaymentStatus(payment.id, 'FAILED').catch(() => {});
       throw err;
-    } finally {
-      client.release();
     }
   }
 
@@ -176,7 +179,6 @@ export class PaymentService {
   async getMerchantStats(merchantId) {
     const stats = await paymentRepository.getMerchantStats(merchantId);
     
-    // Calculate success rate percentage
     const totalCount = parseInt(stats.total_count, 10);
     const successCount = parseInt(stats.success_count, 10);
     const successRate = totalCount === 0 ? 100 : Math.round((successCount / totalCount) * 100);
@@ -187,24 +189,24 @@ export class PaymentService {
       failedCount: parseInt(stats.failed_count, 10),
       totalCount,
       successRate,
-      refundVolume: stats.full_refund_volume.toString() // we will add refund stats detailed in refunds repository
+      refundVolume: stats.full_refund_volume.toString()
     };
   }
 
   formatPayment(p) {
     return {
       id: p.id,
-      merchantId: p.merchant_id,
-      customerWalletId: p.customer_wallet_id,
+      merchantId: p.merchantId,
+      customerWalletId: p.customerWalletId,
       amount: p.amount.toString(),
       currency: p.currency,
       status: p.status,
       reference: p.reference,
       metadata: typeof p.metadata === 'string' ? JSON.parse(p.metadata) : p.metadata,
-      idempotencyKey: p.idempotency_key,
-      createdAt: p.created_at,
-      updatedAt: p.updated_at,
-      businessName: p.business_name || null
+      idempotencyKey: p.idempotencyKey,
+      createdAt: p.createdAt,
+      updatedAt: p.updatedAt,
+      businessName: p.businessName || p.business_name || null
     };
   }
 }

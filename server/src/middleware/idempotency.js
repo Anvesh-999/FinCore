@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import redisClient from '../config/redis.js';
+import { IdempotencyRecord } from '../database/models.js';
 import { AppError } from './error.js';
 import logger from './logger.js';
 
@@ -14,12 +14,6 @@ export const idempotency = async (req, res, next) => {
     return next();
   }
 
-  // Ensure Redis client is connected
-  if (!redisClient.isOpen) {
-    logger.warn('Redis client disconnected. Bypassing idempotency middleware.');
-    return next();
-  }
-
   // Generate request fingerprint: combines path, stringified body, and user ID
   const userId = req.user?.id || 'anonymous';
   const bodyString = JSON.stringify(req.body || {});
@@ -28,14 +22,10 @@ export const idempotency = async (req, res, next) => {
     .update(`${req.originalUrl}:${bodyString}:${userId}`)
     .digest('hex');
 
-  const redisKey = `idempotency:${key}`;
-
   try {
-    const cachedRecord = await redisClient.get(redisKey);
+    const record = await IdempotencyRecord.findOne({ idempotencyKey: key });
     
-    if (cachedRecord) {
-      const record = JSON.parse(cachedRecord);
-      
+    if (record) {
       if (record.status === 'PROCESSING') {
         return next(
           new AppError(
@@ -48,7 +38,7 @@ export const idempotency = async (req, res, next) => {
 
       if (record.status === 'COMPLETED') {
         // Enforce: Same key + different request -> reject
-        if (record.fingerprint !== fingerprint) {
+        if (record.requestHash !== fingerprint) {
           return next(
             new AppError(
               'IDEMPOTENCY_CONFLICT',
@@ -61,50 +51,56 @@ export const idempotency = async (req, res, next) => {
         // Return cached result
         logger.info(`Idempotent cache hit for key: ${key}`);
         return res
-          .status(record.statusCode)
+          .status(record.responseStatus)
           .set('X-Cache-Lookup', 'HIT - Idempotent')
           .json(record.responseBody);
       }
     }
 
-    // Save key in Redis with state 'PROCESSING'
-    await redisClient.set(
-      redisKey,
-      JSON.stringify({
-        status: 'PROCESSING',
-        fingerprint,
-      }),
-      {
-        EX: 86400, // 24 hours expiry
+    // Attempt to atomically register the processing key
+    try {
+      await IdempotencyRecord.create({
+        idempotencyKey: key,
+        requestHash: fingerprint,
+        status: 'PROCESSING'
+      });
+    } catch (err) {
+      // Handle MongoDB duplicate key error (code 11000)
+      if (err.code === 11000) {
+        return next(
+          new AppError(
+            'IDEMPOTENCY_CONFLICT',
+            'A request with this idempotency key is already being processed or completed',
+            409
+          )
+        );
       }
-    );
+      throw err;
+    }
 
     // Override res.json to capture response on successful completion
     const originalJson = res.json;
     res.json = function (body) {
-      // Revert function to avoid issues
       res.json = originalJson;
 
-      // Async save to Redis
       if (res.statusCode >= 200 && res.statusCode < 300) {
-        redisClient.set(
-          redisKey,
-          JSON.stringify({
-            status: 'COMPLETED',
-            fingerprint,
-            statusCode: res.statusCode,
-            responseBody: body,
-          }),
+        IdempotencyRecord.findOneAndUpdate(
+          { idempotencyKey: key },
           {
-            EX: 86400, // 24 hours
+            $set: {
+              status: 'COMPLETED',
+              responseStatus: res.statusCode,
+              responseBody: body,
+              requestHash: fingerprint
+            }
           }
         ).catch((err) => {
-          logger.error('Failed to save completed idempotency cache in Redis:', err);
+          logger.error('Failed to save completed idempotency cache in MongoDB:', err);
         });
       } else {
-        // If request failed, remove the lock so they can try again with same key
-        redisClient.del(redisKey).catch((err) => {
-          logger.error('Failed to clean up failed idempotency key in Redis:', err);
+        // If request failed, remove the lock so they can retry with same key
+        IdempotencyRecord.deleteOne({ idempotencyKey: key }).catch((err) => {
+          logger.error('Failed to clean up failed idempotency key in MongoDB:', err);
         });
       }
 

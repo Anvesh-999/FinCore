@@ -1,71 +1,67 @@
 import crypto from 'crypto';
-import pool from '../../config/db.js';
+import { LedgerAccount, LedgerTransaction, LedgerEntry, Counter } from '../../database/models.js';
 import { AppError } from '../../middleware/error.js';
 import logger from '../../middleware/logger.js';
 
 export class LedgerService {
   /**
+   * Helper to format ledger accounts to match database row format.
+   */
+  formatLedgerAccount(account) {
+    if (!account) return null;
+    return {
+      id: account._id,
+      holder_type: account.holderType,
+      holder_id: account.holderId,
+      created_at: account.createdAt
+    };
+  }
+
+  /**
    * Retrieves or creates the global system treasury ledger account.
    */
-  async getOrCreateSystemAccount(client) {
-    const db = client || pool;
-    
+  async getOrCreateSystemAccount(session) {
     // Find existing system account
-    const selectQuery = `
-      SELECT * FROM ledger_accounts 
-      WHERE holder_type = 'SYSTEM' 
-      LIMIT 1
-    `;
-    const result = await db.query(selectQuery);
-    if (result.rows[0]) {
-      return result.rows[0];
+    let account = await LedgerAccount.findOne({ holderType: 'SYSTEM' });
+    if (account) {
+      return this.formatLedgerAccount(account.toObject());
     }
 
     // Create system account if missing
-    const insertQuery = `
-      INSERT INTO ledger_accounts (holder_type, holder_id)
-      VALUES ('SYSTEM', NULL)
-      RETURNING *
-    `;
-    const insertResult = await db.query(insertQuery);
+    const nextId = await Counter.getNextSequence('ledger_accounts');
+    const newAccountList = await LedgerAccount.create(
+      [{ _id: nextId, holderType: 'SYSTEM', holderId: null }],
+      { session }
+    );
     logger.info('Global system treasury ledger account initialized');
-    return insertResult.rows[0];
+    return this.formatLedgerAccount(newAccountList[0].toObject());
   }
 
   /**
    * Creates a ledger account for a specific user.
    */
-  async createLedgerAccount(holderType, holderId, client) {
-    const db = client || pool;
-    const query = `
-      INSERT INTO ledger_accounts (holder_type, holder_id)
-      VALUES ($1, $2)
-      RETURNING *
-    `;
-    const result = await db.query(query, [holderType, holderId]);
-    return result.rows[0];
+  async createLedgerAccount(holderType, holderId, session) {
+    const nextId = await Counter.getNextSequence('ledger_accounts');
+    const account = await LedgerAccount.create(
+      [{ _id: nextId, holderType, holderId: Number(holderId) }],
+      { session }
+    );
+    return this.formatLedgerAccount(account[0].toObject());
   }
 
   /**
    * Retrieves a ledger account by user/merchant ID and type.
    */
-  async findLedgerAccount(holderType, holderId, client) {
-    const db = client || pool;
-    const query = `
-      SELECT * FROM ledger_accounts 
-      WHERE holder_type = $1 AND holder_id = $2
-    `;
-    const result = await db.query(query, [holderType, holderId]);
-    return result.rows[0] || null;
+  async findLedgerAccount(holderType, holderId) {
+    const account = await LedgerAccount.findOne({ holderType, holderId: Number(holderId) }).lean();
+    return this.formatLedgerAccount(account);
   }
 
   /**
    * Posts a balanced double-entry transaction.
    * Every entry MUST balance: Sum(DEBIT) === Sum(CREDIT).
    */
-  async postTransaction({ referenceType, referenceId, entries }, client) {
-    const db = client || pool;
-    
+  async postTransaction({ referenceType, referenceId, entries }, session) {
     // Validate entry balances
     let totalDebit = 0n;
     let totalCredit = 0n;
@@ -95,28 +91,26 @@ export class LedgerService {
     const transactionId = crypto.randomUUID();
 
     // 1. Create Ledger Transaction
-    const txQuery = `
-      INSERT INTO ledger_transactions (id, reference_type, reference_id, status)
-      VALUES ($1, $2, $3, 'POSTED')
-      RETURNING *
-    `;
-    await db.query(txQuery, [transactionId, referenceType, referenceId]);
+    await LedgerTransaction.create(
+      [{
+        _id: transactionId,
+        referenceType,
+        referenceId,
+        status: 'POSTED'
+      }],
+      { session }
+    );
 
     // 2. Create Ledger Entries
-    const entryQuery = `
-      INSERT INTO ledger_entries (ledger_transaction_id, ledger_account_id, direction, amount, currency)
-      VALUES ($1, $2, $3, $4, $5)
-    `;
+    const entriesData = entries.map(entry => ({
+      ledgerTransactionId: transactionId,
+      ledgerAccountId: Number(entry.accountId),
+      direction: entry.direction,
+      amount: Number(entry.amount),
+      currency: entry.currency || 'USD'
+    }));
 
-    for (const entry of entries) {
-      await db.query(entryQuery, [
-        transactionId,
-        entry.accountId,
-        entry.direction,
-        BigInt(entry.amount),
-        entry.currency || 'USD',
-      ]);
-    }
+    await LedgerEntry.create(entriesData, { session });
 
     logger.info(`Posted ledger transaction ${transactionId} (${referenceType})`);
     return transactionId;
