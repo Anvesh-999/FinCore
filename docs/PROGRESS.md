@@ -5,7 +5,7 @@
 - **STEP 1 — FOUNDATION + DESIGN SYSTEM + AUTH** [COMPLETE]
 - **STEP 2 — WALLET + LEDGER + TRANSFER ENGINE** [COMPLETE]
 - **STEP 3 — MERCHANT PAYMENTS + REFUNDS + DEVELOPER PLATFORM** [COMPLETE]
-- **STEP 4 — WEBHOOKS + RISK + RECONCILIATION + OPERATIONS** [NOT STARTED]
+- **STEP 4 — WEBHOOKS + RISK + RECONCILIATION + OPERATIONS** [COMPLETE]
 - **STEP 5 — PRODUCTION QUALITY + PERFORMANCE + DEPLOYMENT** [NOT STARTED]
 
 ---
@@ -39,5 +39,14 @@
 - [x] **Step 3F — Full & Partial Refunds**: Implement merchant-triggered refund mechanism with support for partial/full refunds, enforce refund total limit verification, and post compensating ledger postings.
 - [x] **Step 3G/3H — Merchant Dashboard & Integration Tests**: Build comprehensive developer-style interfaces for overview statistics, transaction lists, API key management, Webhook logs, and merchant refunds. Expand 15 integration tests for state machine transitions, API key auth, ledger updates, refund limits, and concurrent refund safety.
   - *Commit*: `c3f4bab` — `feat(payment): implement merchant onboarding, sandbox checkout, and refunds`
+  - *Commit*: `d7a59ec` — `docs(progress): update progress for step 3`
+
+### STEP 4 — WEBHOOKS + RISK + RECONCILIATION + OPERATIONS [COMPLETE]
+- [x] **Step 4A/4B/4C/4D — Webhook Queue & Reliable Delivery**: Set up RabbitMQ message broker connections, design background event queues, sign webhook payloads using HMAC SHA-256, implement exponential backoff retries with attempt logs, and build developer consoles in the Merchant dashboard allowing manual retry controls.
+- [x] **Step 4E — Deterministic Risk Rules**: Build modular risk engine verifying velocity limits, high-amount thresholds, and transaction speed parameters. Flag medium-risk transactions, veto high-risk items, and log immutable operational audit logs.
+- [x] **Step 4F/4G/4H — Sockets, Reconciliation Engine, & Operations Console**: Set up Socket.IO live notifications for real-time risk alerts and payment lifecycle updates. Create a reconciliation runner matching system payments/refunds against double-entry ledger listings to identify inconsistencies. Build responsive admin operations control views (payments, refunds, risk, webhooks, reconciliation runs, live system statuses).
+- [x] **Step 4I — Reliability Integration Tests**: Design robust backend tests checking webhook signings, automatic queue backoff, risk engine veto configurations, admin-only routes, and reconciliation runs.
+  - *Commit*: `42d75cc` — `feat(operations): implement webhooks, risk engine, reconciliation checks, and admin operations console`
+
 
 
