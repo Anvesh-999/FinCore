@@ -4,7 +4,7 @@
 
 - **STEP 1 — FOUNDATION + DESIGN SYSTEM + AUTH** [COMPLETE]
 - **STEP 2 — WALLET + LEDGER + TRANSFER ENGINE** [COMPLETE]
-- **STEP 3 — MERCHANT PAYMENTS + REFUNDS + DEVELOPER PLATFORM** [NOT STARTED]
+- **STEP 3 — MERCHANT PAYMENTS + REFUNDS + DEVELOPER PLATFORM** [COMPLETE]
 - **STEP 4 — WEBHOOKS + RISK + RECONCILIATION + OPERATIONS** [NOT STARTED]
 - **STEP 5 — PRODUCTION QUALITY + PERFORMANCE + DEPLOYMENT** [NOT STARTED]
 
@@ -31,4 +31,13 @@
     - `fc60bdd` — `feat(ledger): implement wallet models, double-entry ledger service, and peer transfers with integration tests`
     - `2b1103d` — `feat(admin): implement operations admin endpoints for wallets, transfers, and double-entry ledger`
     - `4ef4bda` — `feat(frontend): implement wallet, peer transfers, transaction list, and admin wallet/transfer/ledger explorers`
+    - `d276d49` — `docs(progress): update progress for step 2`
+
+### STEP 3 — MERCHANT PAYMENTS + REFUNDS + DEVELOPER PLATFORM [COMPLETE]
+- [x] **Step 3A/3B — Merchant Profiles & Sandbox API Keys**: Auto-onboard merchant profiles upon registration, generate cryptographically secure public and secret API credentials (using SHA-256 for secret storage), and support key metadata lookup and revocation.
+- [x] **Step 3C/3D/3E — Payment Orders & Sandbox Checkout**: Enable order creation via authenticated merchant key authorization. Implement standalone sandbox checkout page with item totals and a confirm button, and process simulated payment order transitions (CREATED, PENDING, PROCESSING, SUCCEEDED, FAILED) posting balanced ledger entries.
+- [x] **Step 3F — Full & Partial Refunds**: Implement merchant-triggered refund mechanism with support for partial/full refunds, enforce refund total limit verification, and post compensating ledger postings.
+- [x] **Step 3G/3H — Merchant Dashboard & Integration Tests**: Build comprehensive developer-style interfaces for overview statistics, transaction lists, API key management, Webhook logs, and merchant refunds. Expand 15 integration tests for state machine transitions, API key auth, ledger updates, refund limits, and concurrent refund safety.
+  - *Commit*: `c3f4bab` — `feat(payment): implement merchant onboarding, sandbox checkout, and refunds`
+
 
