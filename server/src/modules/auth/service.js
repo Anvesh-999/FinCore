@@ -6,6 +6,7 @@ import { AppError } from '../../middleware/error.js';
 import pool from '../../config/db.js';
 import ledgerService from '../ledger/service.js';
 import walletRepository from '../wallets/repository.js';
+import merchantRepository from '../merchants/repository.js';
 
 export class AuthService {
   async register({ firstName, lastName, email, password, role }) {
@@ -35,7 +36,17 @@ export class AuthService {
       }, client);
 
       // Create double-entry ledger account
-      const ledgerAccount = await ledgerService.createLedgerAccount('CUSTOMER', newUser.id, client);
+      const holderType = role === 'MERCHANT' ? 'MERCHANT' : 'CUSTOMER';
+      const ledgerAccount = await ledgerService.createLedgerAccount(holderType, newUser.id, client);
+
+      // Auto-create merchant profile if role is MERCHANT
+      if (role === 'MERCHANT') {
+        await merchantRepository.createMerchant({
+          userId: newUser.id,
+          businessName: `${firstName}'s Sandbox Business`,
+          businessType: 'INDIVIDUAL',
+        }, client);
+      }
 
       // Create wallet: Customer role gets default $1,000.00 sandbox balance, others get $0.00
       const defaultBalance = role === 'CUSTOMER' ? 100000n : 0n;
